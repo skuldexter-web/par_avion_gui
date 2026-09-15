@@ -76,10 +76,6 @@ class IssView(BaseView):
         self.fetch_btn = ctk.CTkButton(btn_row, text="Fetch TLE & Predict Pass",
                                         height=36, command=self._fetch)
         self.fetch_btn.pack(side="left", padx=(0, 8))
-        self.launch_btn = ctk.CTkButton(btn_row, text="Launch Full ISS View",
-                                         height=36,
-                                         command=lambda: self.launch_cli_mode("iss", "ISS Tracker"))
-        self.launch_btn.pack(side="left")
 
     def _fetch(self) -> None:
         lat_text = self.lat_entry.get().strip()

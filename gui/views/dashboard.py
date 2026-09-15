@@ -9,7 +9,6 @@ for every mode.
 
 from __future__ import annotations
 
-import os
 import sys
 
 import customtkinter as ctk
@@ -131,10 +130,22 @@ class DashboardView(BaseView):
         ctk.CTkLabel(frame, text=desc, font=ctk.CTkFont(size=11),
                      text_color=self.theme.text_dim, wraplength=200, justify="left"
                      ).pack(anchor="w", padx=14, pady=(0, 10))
-        btn = ctk.CTkButton(frame, text="Launch", height=30,
-                             command=lambda: self.launch_cli_mode(key, label))
+        btn = ctk.CTkButton(frame, text="Open", height=30,
+                             command=lambda: self._navigate_to(key))
         btn.pack(fill="x", padx=14, pady=(0, 12))
         return frame
+
+    def _navigate_to(self, key: str) -> None:
+        """Switch to the given mode's tab in-app — every mode is now a
+        fully embedded view, so 'launching' a mode from the dashboard
+        just means showing its tab, never spawning an external terminal."""
+        app = self.winfo_toplevel()
+        show_fn = getattr(app, "_show_view", None)
+        sidebar = getattr(app, "sidebar", None)
+        if callable(show_fn):
+            show_fn(key)
+        if sidebar is not None:
+            sidebar.set_active(key)
 
     # ------------------------------------------------------------------
     def _refresh_hardware(self) -> None:

@@ -12,7 +12,6 @@ touched from the main thread.
 from __future__ import annotations
 
 import queue
-import time
 from datetime import datetime
 
 import customtkinter as ctk
@@ -112,12 +111,6 @@ class LogConsole(ctk.CTkFrame):
             self.log("Output copied to clipboard.", "success")
         except Exception as e:
             self.log(f"Could not copy to clipboard: {e}", "error")
-
-    def apply_theme(self, theme: Theme) -> None:
-        """Re-apply colors after a light/dark toggle."""
-        self.theme = theme
-        self.configure(fg_color=theme.panel)
-        self.textbox.configure(fg_color=theme.console_bg)
 
     def destroy(self) -> None:
         try:

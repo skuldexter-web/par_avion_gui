@@ -7,7 +7,7 @@
 # - Installs system packages needed for the GUI (python3-tk) and for the
 #   backend SDR/audio tools (rtl-sdr, sox, etc. — same as the CLI's own
 #   install.sh)
-# - Creates a dedicated Python virtual environment (.venv), required on
+# - Creates a dedicated Python virtual environment (venv), required on
 #   modern Debian/Kali/Raspberry Pi OS due to PEP 668 (externally
 #   managed environment) blocking a plain `pip install`
 # - Installs Python dependencies into that venv
@@ -20,7 +20,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="$SCRIPT_DIR/.venv"
+VENV_DIR="$SCRIPT_DIR/venv"
 
 echo "=============================================="
 echo "  PAR AVION GUI — Installation"
@@ -162,8 +162,27 @@ systemctl restart gpsd.socket >/dev/null 2>&1 || true
 # ---------------------------------------------------------------------
 echo ""
 echo "[4/5] Setting up Python virtual environment..."
+
+# Make sure REAL_USER actually owns the project directory before trying
+# to create a venv as that user — a repo cloned or copied while running
+# as root (common when install.sh itself was invoked via sudo from the
+# start) leaves SCRIPT_DIR root-owned, which is exactly what produces a
+# "Permission denied" error when venv creation is later attempted as an
+# unprivileged user.
+if [[ "$(stat -c '%U' "$SCRIPT_DIR")" != "$REAL_USER" ]]; then
+    echo "  Fixing ownership of $SCRIPT_DIR (currently not owned by $REAL_USER)..."
+    chown -R "$REAL_USER":"$REAL_USER" "$SCRIPT_DIR"
+fi
+
 if [[ ! -d "$VENV_DIR" ]]; then
-    sudo -u "$REAL_USER" python3 -m venv "$VENV_DIR" --system-site-packages
+    if ! sudo -u "$REAL_USER" python3 -m venv "$VENV_DIR" --system-site-packages; then
+        echo ""
+        echo "  ERROR: could not create the virtual environment at $VENV_DIR"
+        echo "  This is usually a permissions problem. Try:"
+        echo "    sudo chown -R $REAL_USER:$REAL_USER '$SCRIPT_DIR'"
+        echo "  then re-run ./install.sh"
+        exit 1
+    fi
     echo "  Created $VENV_DIR (--system-site-packages so it can see the"
     echo "  apt-installed python3-tk, which pip cannot install on its own)."
 else
@@ -226,7 +245,7 @@ echo "=============================================="
 echo ""
 echo "To launch PAR AVION GUI:"
 echo "  cd $SCRIPT_DIR"
-echo "  source .venv/bin/activate"
+echo "  source venv/bin/activate"
 echo "  python3 main.py"
 echo ""
 echo "Or use the desktop launcher created above, if you chose that option."

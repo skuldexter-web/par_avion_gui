@@ -20,7 +20,7 @@ import customtkinter as ctk
 
 from gui.components.console import LogConsole
 from gui.components.sidebar import Sidebar
-from gui.themes.theme import Theme
+from gui.themes.theme import Theme, apply_dark_mode
 
 # Views are imported lazily inside _build_views() so a single broken
 # view module doesn't prevent the whole app from importing/starting —
@@ -43,8 +43,8 @@ class ParAvionApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.theme = Theme("dark")
-        ctk.set_appearance_mode("dark")
+        self.theme = Theme()
+        apply_dark_mode()
         ctk.set_default_color_theme("green")
 
         self.title("PAR AVION — Tactical RF & Telemetry Suite")
@@ -58,7 +58,7 @@ class ParAvionApp(ctk.CTk):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self.sidebar = Sidebar(self, self.theme, self._show_view, self._toggle_theme)
+        self.sidebar = Sidebar(self, self.theme, self._show_view)
         self.sidebar.grid(row=0, column=0, sticky="ns")
 
         right = ctk.CTkFrame(self, fg_color=self.theme.bg, corner_radius=0)
@@ -115,38 +115,6 @@ class ParAvionApp(ctk.CTk):
             view.tkraise()
             self._active_view_key = key
             self.sidebar.set_active(key)
-
-    def _toggle_theme(self) -> None:
-        mode = self.theme.toggle()
-        self.configure(fg_color=self.theme.bg)
-        self.sidebar.apply_theme(self.theme)
-        self.console.apply_theme(self.theme)
-        for view in self._views.values():
-            apply_fn = getattr(view, "apply_theme", None)
-            if callable(apply_fn):
-                apply_fn(self.theme)
-        # Views that rebuild their widgets in apply_theme() (several do a
-        # full teardown/recreate rather than recoloring in place) lose
-        # their raised stacking position when that happens — without
-        # this, the active view can end up mapped-but-hidden behind a
-        # freshly rebuilt inactive view, appearing as a blank/black
-        # panel until the user manually switches tabs and back.
-        if self._active_view_key is not None:
-            active_view = self._views.get(self._active_view_key)
-            if active_view is not None:
-                active_view.tkraise()
-        # Labels inside a CTkScrollableFrame are drawn on that widget's
-        # internal Canvas — querying their .cget("text_color") right
-        # after a rebuild correctly shows the new color, but the Canvas
-        # itself doesn't always repaint on its own until Tk's event loop
-        # processes a fresh idle/redraw cycle. update_idletasks() forces
-        # that pass immediately rather than waiting for some later event
-        # to trigger it, which otherwise left freshly-rebuilt scrollable
-        # content visually stuck showing the old theme's colors even
-        # though the widgets themselves already had the right values.
-        self.update_idletasks()
-        self.update()
-        self.console.log(f"Switched to {mode} mode.", "info")
 
     def _on_close(self) -> None:
         # Give every view a chance to stop background threads/subprocess

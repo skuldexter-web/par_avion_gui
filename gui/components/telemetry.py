@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import queue
 import threading
-import time
 
 import customtkinter as ctk
 
@@ -108,10 +107,6 @@ class TelemetryWidget(ctk.CTkFrame):
         if pct >= 70:
             return ACCENT_AMBER
         return ACCENT_GREEN
-
-    def apply_theme(self, theme: Theme) -> None:
-        self.theme = theme
-        self.configure(fg_color=theme.panel)
 
     def shutdown(self) -> None:
         """Call before destroying the widget/closing the app so the

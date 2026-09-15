@@ -1,10 +1,11 @@
 """
 gui/components/sidebar.py — Left sidebar navigation rail.
 
-Holds the mode-switch buttons (one per CLI mode), the telemetry widget,
-and the light/dark theme toggle, per the "sidebar navigation rail"
-layout requirement. Clicking a nav button calls back into the main App
-to swap the visible view; the sidebar itself holds no view logic.
+Holds the mode-switch buttons (one per CLI mode) and the telemetry
+widget, per the "sidebar navigation rail" layout requirement. Clicking
+a nav button calls back into the main App to swap the visible view;
+the sidebar itself holds no view logic. The application is strictly
+dark-mode only — there is no theme toggle here or anywhere else.
 """
 
 from __future__ import annotations
@@ -32,13 +33,11 @@ NAV_ITEMS = [
 class Sidebar(ctk.CTkFrame):
     def __init__(self, master, theme: Theme,
                  on_nav: Callable[[str], None],
-                 on_theme_toggle: Callable[[], None],
                  **kwargs):
         super().__init__(master, fg_color=theme.sidebar, corner_radius=0,
                           width=210, **kwargs)
         self.theme = theme
         self.on_nav = on_nav
-        self.on_theme_toggle = on_theme_toggle
         self.grid_propagate(False)
 
         self._nav_buttons: dict[str, ctk.CTkButton] = {}
@@ -75,33 +74,13 @@ class Sidebar(ctk.CTkFrame):
 
         # --- Telemetry ---
         self.telemetry = TelemetryWidget(self, theme)
-        self.telemetry.pack(fill="x", padx=10, pady=(10, 6), side="bottom")
-
-        # --- Theme toggle ---
-        toggle_frame = ctk.CTkFrame(self, fg_color="transparent")
-        toggle_frame.pack(fill="x", padx=10, pady=(0, 12), side="bottom")
-        ctk.CTkLabel(toggle_frame, text="Theme", font=ctk.CTkFont(size=11),
-                     text_color=theme.text_dim).pack(side="left")
-        self.theme_switch = ctk.CTkSwitch(
-            toggle_frame, text="Dark" if theme.mode == "dark" else "Light",
-            command=self._handle_theme_toggle, onvalue="dark", offvalue="light",
-        )
-        self.theme_switch.pack(side="right")
-        if theme.mode == "dark":
-            self.theme_switch.select()
-        else:
-            self.theme_switch.deselect()
+        self.telemetry.pack(fill="x", padx=10, pady=(10, 12), side="bottom")
 
         self.set_active("dashboard")
 
     def _handle_nav_click(self, key: str) -> None:
         self.set_active(key)
         self.on_nav(key)
-
-    def _handle_theme_toggle(self) -> None:
-        self.on_theme_toggle()
-        mode = self.theme.mode
-        self.theme_switch.configure(text="Dark" if mode == "dark" else "Light")
 
     def set_active(self, key: str) -> None:
         """Visually highlight the active nav item."""
@@ -114,9 +93,3 @@ class Sidebar(ctk.CTkFrame):
                               font=ctk.CTkFont(size=13, weight="normal"))
         self._active_key = key
 
-    def apply_theme(self, theme: Theme) -> None:
-        self.theme = theme
-        self.configure(fg_color=theme.sidebar)
-        self.telemetry.apply_theme(theme)
-        if self._active_key:
-            self.set_active(self._active_key)
