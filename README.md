@@ -59,8 +59,8 @@ CelesTrak / ARISS / AMSAT — all keyless, and switchable off in Settings.
 ## Install
 
 ```bash
-git clone https://github.com/skuldexter-web/par-avion-gui.git
-cd par-avion-gui
+git clone https://github.com/skuldexter-web/par_avion_gui.git
+cd par_avion_gui
 chmod +x install.sh
 ./install.sh
 ```
