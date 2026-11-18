@@ -194,8 +194,8 @@ def full_report() -> HardwareReport:
     if report.gps is None:
         report.errors.append(
             "No GPS source found (gpsd not running, no /dev/ttyUSB* "
-            "candidates). Radar will center on a manually-set fallback "
-            "location instead of live GPS."
+            "candidates). Set a home location in Settings so range and "
+            "bearing have something to measure from."
         )
 
     report.dump1090_running = is_dump1090_running()

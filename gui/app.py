@@ -63,7 +63,7 @@ class ParAvionApp(ctk.CTk):
 
         right = ctk.CTkFrame(self, fg_color=self.theme.bg, corner_radius=0)
         right.grid(row=0, column=1, sticky="nsew")
-        right.grid_rowconfigure(0, weight=3)  # view area gets more space
+        right.grid_rowconfigure(0, weight=4)  # view area gets most of it
         right.grid_rowconfigure(1, weight=1)  # console gets the rest
         right.grid_columnconfigure(0, weight=1)
 
@@ -83,38 +83,46 @@ class ParAvionApp(ctk.CTk):
 
     # ------------------------------------------------------------------
     def _build_views(self) -> None:
-        for key, (module_path, class_name) in VIEW_MODULES.items():
-            try:
-                module = __import__(module_path, fromlist=[class_name])
-                view_cls = getattr(module, class_name)
-                view = view_cls(self.view_container, self.theme, self.console)
-                view.grid(row=0, column=0, sticky="nsew")
-                self._views[key] = view
-            except Exception as e:
-                # A broken view shouldn't take down the whole app —
-                # log it and fall back to a placeholder so navigation
-                # still works for every other tab.
-                placeholder = ctk.CTkFrame(self.view_container, fg_color="transparent")
-                ctk.CTkLabel(
-                    placeholder,
-                    text=f"'{key}' view failed to load:\n{e}",
-                    text_color="#e05c5c", justify="left",
-                ).pack(padx=20, pady=20, anchor="w")
-                placeholder.grid(row=0, column=0, sticky="nsew")
-                self._views[key] = placeholder
-                self.console.log(f"View '{key}' failed to load: {e}", "error")
+        """Views are built on first use rather than all at once.
 
+        Constructing all nine up front meant every map widget loaded its
+        vector layers and every view ran its startup probes before the
+        window was usable — several seconds on a Raspberry Pi, most of
+        it for tabs the operator may never open. Each view is built the
+        first time it is shown and then kept, so switching back is
+        instant.
+        """
         self.view_container.grid_rowconfigure(0, weight=1)
         self.view_container.grid_columnconfigure(0, weight=1)
+
+    def _build_view(self, key: str):
+        module_path, class_name = VIEW_MODULES[key]
+        try:
+            module = __import__(module_path, fromlist=[class_name])
+            view_cls = getattr(module, class_name)
+            view = view_cls(self.view_container, self.theme, self.console)
+        except Exception as e:
+            # A broken view shouldn't take down the whole app — show the
+            # reason in its place so every other tab still works.
+            view = ctk.CTkFrame(self.view_container, fg_color="transparent")
+            ctk.CTkLabel(
+                view, text=f"'{key}' view failed to load:\n{e}",
+                text_color="#e05c5c", justify="left",
+            ).pack(padx=20, pady=20, anchor="w")
+            self.console.log(f"View '{key}' failed to load: {e}", "error")
+        view.grid(row=0, column=0, sticky="nsew")
+        self._views[key] = view
+        return view
 
     def _show_view(self, key: str) -> None:
         if key == self._active_view_key:
             return
-        view = self._views.get(key)
-        if view is not None:
-            view.tkraise()
-            self._active_view_key = key
-            self.sidebar.set_active(key)
+        if key not in VIEW_MODULES:
+            return
+        view = self._views.get(key) or self._build_view(key)
+        view.tkraise()
+        self._active_view_key = key
+        self.sidebar.set_active(key)
 
     def _on_close(self) -> None:
         # Give every view a chance to stop background threads/subprocess

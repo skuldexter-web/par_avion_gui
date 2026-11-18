@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PAR AVION — Tactical RF & Telemetry Suite v2.0
+PAR AVION — Tactical RF & Telemetry Suite v2.1
 Main CLI entry point and TUI engine.
 
 Usage:
@@ -47,7 +47,7 @@ BANNER = [
     r"              ░  ░   ░              ░  ░       ░   ░      ░ ░           ░ ",
 ]
 
-TAGLINE = "— Tactical RF & Telemetry Suite v2.0 —"
+TAGLINE = "— Tactical RF & Telemetry Suite v2.1 —"
 
 MENU_ITEMS = [
     ("1", "Airplanes", "ADS-B 1090MHz + Dynamic Tactical Radar"),
@@ -80,7 +80,7 @@ def draw_menu(stdscr, hw_report, gps_lat, gps_lon) -> None:
     divider = "=" * min(width - 2, 54)
     menu_x = max(0, (width - len(divider)) // 2)
 
-    lines = [divider, "  PAR AVION — Tactical RF & Telemetry Suite v2.0", divider]
+    lines = [divider, "  PAR AVION — Tactical RF & Telemetry Suite v2.1", divider]
     for key, label, desc in MENU_ITEMS:
         if desc:
             lines.append(f"  [ {key} ] {label:<10} ({desc})")

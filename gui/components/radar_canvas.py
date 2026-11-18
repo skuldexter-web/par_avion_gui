@@ -60,6 +60,7 @@ class RadarCanvas(ctk.CTkCanvas):
         self._sweep_deg = 0.0
         self._animating = True
         self._after_id = None
+        self._message = ""
 
         self.bind("<Configure>", lambda e: self._redraw())
         self._tick()
@@ -71,6 +72,13 @@ class RadarCanvas(ctk.CTkCanvas):
 
     def set_max_range(self, max_range_nm: float) -> None:
         self.max_range_nm = max(0.1, max_range_nm)
+        self._redraw()
+
+    def set_message(self, text: str) -> None:
+        """Show a line of explanation across the scope — used to say why
+        there is nothing plotted (no reference position, no feed yet)
+        instead of leaving an empty scope that looks like a dead band."""
+        self._message = text or ""
         self._redraw()
 
     def pause(self) -> None:
@@ -101,7 +109,11 @@ class RadarCanvas(ctk.CTkCanvas):
         w = self.winfo_width() or 400
         h = self.winfo_height() or 400
         cx, cy = w / 2, h / 2
-        r_max = max(10.0, min(w, h) / 2 - 40)  # margin for compass labels
+        # Reserve room outside the scope for the compass letters, but
+        # scale that reserve down on a small panel — a fixed 40 px margin
+        # eats most of the radius when the view is short.
+        margin = 40 if min(w, h) >= 340 else 28
+        r_max = max(10.0, min(w, h) / 2 - margin)
         return w, h, cx, cy, r_max
 
     def _redraw(self) -> None:
@@ -113,6 +125,9 @@ class RadarCanvas(ctk.CTkCanvas):
         self._draw_compass(cx, cy, r_max)
         self._draw_sweep(cx, cy, r_max)
         self._draw_contacts(cx, cy, r_max)
+        if self._message:
+            self.create_text(cx, h - 14, text=self._message, fill="#e0a940",
+                             font=("Consolas", 10), width=max(100, w - 20))
 
     def _draw_rings(self, cx, cy, r_max) -> None:
         for i in range(1, self.ring_count + 1):
@@ -189,7 +204,15 @@ class RadarCanvas(ctk.CTkCanvas):
         return f"#{r:02x}{g:02x}{b:02x}"
 
     def _draw_contacts(self, cx, cy, r_max) -> None:
-        for c in self._contacts:
+        # Draw the closest contacts first so that, when labels have to be
+        # dropped for space, it is the distant ones that lose them.
+        contacts = sorted(self._contacts, key=lambda c: c.distance_nm)
+        # With a crowded scope, two lines per contact is unreadable —
+        # drop to the identifier alone.
+        max_lines = 2 if len(contacts) <= 6 else 1
+        occupied: List[tuple] = []
+
+        for c in contacts:
             frac = min(1.0, max(0.0, c.distance_nm / self.max_range_nm)) if self.max_range_nm else 0.0
             r = frac * r_max
             ang = math.radians(c.bearing_deg)
@@ -198,14 +221,32 @@ class RadarCanvas(ctk.CTkCanvas):
 
             self.create_text(x, y, text=c.glyph, fill=self.color,
                               font=("Consolas", 14, "bold"))
-            # Flip the label to the left of the blip when it's in the
-            # right half of the canvas, and right-align it there —
-            # otherwise labels on contacts near the East edge get
-            # clipped off the visible canvas area (the offset would
-            # push them further right, off-screen).
+
+            lines = [ln for ln in list(c.label_lines)[:max_lines] if ln]
+            if not lines:
+                continue
+            # Flip the label to the left of the blip in the right half of
+            # the scope so it isn't clipped off the edge.
             on_right_half = x > cx
             label_x = x - 12 if on_right_half else x + 12
             anchor = "e" if on_right_half else "w"
-            for i, line in enumerate(c.label_lines):
-                self.create_text(label_x, y - 8 + i * 12, text=line, fill=self.color,
+
+            # Consolas 9pt is about 7 px per character; under-estimating
+            # here lets labels that actually overlap pass the collision
+            # test, which is what produced the pile-up at scope centre.
+            width_px = max(len(ln) for ln in lines) * 7.2 + 4
+            top = y - 8
+            box = ((label_x - width_px, top - 6, label_x, top + 6 + 12 * len(lines))
+                   if on_right_half else
+                   (label_x, top - 6, label_x + width_px, top + 6 + 12 * len(lines)))
+            if any(self._overlaps(box, other) for other in occupied):
+                continue       # symbol stays, label is dropped
+            occupied.append(box)
+
+            for i, line in enumerate(lines):
+                self.create_text(label_x, top + i * 12, text=line, fill=self.color,
                                   font=("Consolas", 9), anchor=anchor)
+
+    @staticmethod
+    def _overlaps(a, b) -> bool:
+        return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])

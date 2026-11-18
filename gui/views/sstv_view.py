@@ -105,7 +105,12 @@ class SstvView(BaseView):
 
         self.reset_btn = ctk.CTkButton(controls, text="Reset", height=34,
                                         command=self._reset)
-        self.reset_btn.pack(fill="x", padx=14, pady=(0, 14))
+        self.reset_btn.pack(fill="x", padx=14, pady=(0, 8))
+
+        self.wav_btn = ctk.CTkButton(controls, text="Decode a .wav file", height=34,
+                                      fg_color="#2b3a46", hover_color="#364857",
+                                      command=self._decode_wav)
+        self.wav_btn.pack(fill="x", padx=14, pady=(0, 14))
 
         self.status_label = ctk.CTkLabel(controls, text="Idle", font=ctk.CTkFont(size=12),
                                           text_color=theme.text_dim, wraplength=220, justify="left")
@@ -183,14 +188,39 @@ class SstvView(BaseView):
 
     def _reset(self) -> None:
         if self._decoder is not None:
-            self._decoder.state = "listening"
-            self._decoder.mode = None
-            self._decoder.image = None
-            self._decoder.current_row = 0
+            # reset() also clears the audio buffer, the decode position,
+            # the sync tracking and Robot 36's held line-pair state —
+            # poking the attributes individually used to leave those
+            # behind, so the next image started mid-stream.
+            self._decoder.reset()
         self._draw_placeholder("Listening for VIS header...")
         self.save_btn.configure(state="disabled")
         self.status_label.configure(text="Reset — listening for a new VIS header.",
                                      text_color=self.theme.text_dim)
+
+    def _decode_wav(self) -> None:
+        """Decode a recorded off-air .wav — the same decode path as live
+        audio, which also makes the whole chain testable with no radio."""
+        from tkinter import filedialog
+
+        path = filedialog.askopenfilename(
+            title="Select an SSTV recording",
+            filetypes=[("WAV audio", "*.wav"), ("All files", "*.*")])
+        if not path:
+            return
+
+        from modules.sstv import AudioCaptureController, SstvDecoder
+        self._stop_listening()
+        self._decoder = SstvDecoder()
+        self._capture = AudioCaptureController()
+        if not self._capture.start_wav(path, self._decoder):
+            self.console.log(f"Could not read that file: {self._capture.last_error}",
+                              "error")
+            return
+        self.console.log(f"Decoding {os.path.basename(path)}...", "info")
+        self.status_label.configure(text="Decoding file...", text_color=ACCENT_GREEN)
+        self._running = True
+        self._poll_job = self.after(self.POLL_MS, self._poll_decoder)
 
     def _poll_decoder(self) -> None:
         if self._decoder is not None:
@@ -205,8 +235,11 @@ class SstvView(BaseView):
             return
         if mode is not None:
             pct = int(100 * current_row / mode.image_lines) if mode.image_lines else 0
+            lock = "sync locked" if self._decoder.sync_locked else "searching for sync"
             self.status_label.configure(
-                text=f"Mode: {mode.name}\nProgress: {current_row}/{mode.image_lines} lines ({pct}%)",
+                text=(f"Mode: {mode.name}\n"
+                      f"Progress: {current_row}/{mode.image_lines} lines ({pct}%)\n"
+                      f"{lock}"),
                 text_color=ACCENT_GREEN,
             )
             if state == "done":

@@ -25,7 +25,7 @@ for path in (_REPO_ROOT, _CORE_DIR):
 def _check_dependencies() -> list[str]:
     missing = []
     try:
-        import customtkinter  # noqa: F401
+        import customtkinter  # noqa: F401  (probe only)
     except ImportError:
         missing.append("customtkinter")
     try:

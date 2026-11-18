@@ -1,31 +1,48 @@
 # PAR AVION GUI — Python dependencies
-# Installed automatically by install.sh into a dedicated .venv.
+# Installed automatically by install.sh into ./venv (no leading dot).
 # Manual install: pip install -r requirements.txt   (inside an activated venv)
+#
+# Nothing here needs an account, a licence key or an API key.
 
 # --- GUI ---
-customtkinter>=5.2.0    # Modern Tkinter-based GUI framework
+customtkinter>=5.2.0     # Modern Tkinter-based GUI framework
 psutil>=5.9.0            # CPU/RAM telemetry widget
-Pillow>=10.0.0            # SSTV live image preview rendering
+Pillow>=10.0.0           # Waterfall image rendering and SSTV image preview
 
-# --- Core backend (unchanged from the CLI's own requirements) ---
-pyrtlsdr==0.2.93        # RTL-SDR hardware interface — pinned: apt's librtlsdr
-                        # (2.0.2 on Kali/Raspberry Pi OS) predates symbols
-                        # pyrtlsdr>=0.3.0 expects (e.g. rtlsdr_set_dithering).
-                        # If you build a newer librtlsdr from source
-                        # (osmocom/rtl-sdr), you can bump this to >=0.3.0.
-gpsd-py3>=0.3.0        # GPSD client for GPS dongle auto-location
-pyserial>=3.5          # Serial fallback for /dev/ttyUSB* GPS devices
-requests>=2.31.0       # TLE downloads (ISS tracking), AIS feed HTTP fallback
-skyfield>=1.47         # Orbital mechanics / TLE propagation for ISS tracking
-numpy>=1.26.0          # FFT / signal processing for waterfall, SSTV, Morse
-scipy>=1.11.0           # Hilbert transform (SSTV continuous frequency tracking)
-sounddevice>=0.4.6      # Microphone input fallback for SSTV/Morse decoding
-pyModeS<3,>=2.13       # ADS-B Mode S message decoding. Pinned below v3:
-                        # v3 removed the pms.adsb.* function-per-field API
-                        # this app's ADS-B decoding is built on.
+# --- Signal processing ---
+numpy>=1.26.0            # FFT, spectrum, SSTV and Morse decoding
+scipy>=1.11.0            # Hilbert transform for SSTV frequency tracking.
+                         # Optional: sstv.py falls back to a pure-numpy
+                         # analytic signal if scipy is unavailable.
 
-# Note: 'tkinter' itself is part of the Python standard library but is
-# packaged separately by Debian/Kali/Raspberry Pi OS as 'python3-tk' — it
-# is NOT installable via pip and must come from apt (install.sh does this).
-# 'curses' (used by the terminal/CLI modes launched from the GUI) is also
-# part of the standard library on Linux and needs no separate install.
+# --- Radio hardware ---
+pyrtlsdr==0.2.93         # RTL-SDR interface — pinned: apt's librtlsdr
+                         # (2.0.2 on Kali/Raspberry Pi OS) predates symbols
+                         # pyrtlsdr>=0.3.0 expects (rtlsdr_set_dithering).
+                         # Building librtlsdr from source (osmocom/rtl-sdr)
+                         # lets you raise this to >=0.3.0.
+pyModeS<3,>=2.13         # ADS-B Mode S decoding. Pinned below v3: v3
+                         # removed the pms.adsb.* API this depends on.
+sounddevice>=0.4.6       # Soundcard input for SSTV/Morse from an external rig
+
+# --- Satellite tracking ---
+sgp4>=2.21               # SGP4 orbit propagation, pure Python with an
+                         # optional C accelerator. No data files, no
+                         # downloads: the ISS tracker runs offline.
+                         # (Replaces skyfield, which pulled in ephemeris
+                         # files and was far heavier for what is needed.)
+
+# --- Optional conveniences ---
+requests>=2.31.0         # Only used to refresh orbital elements. Everything
+                         # works without network access; see data/tle/.
+gpsd-py3>=0.3.0          # GPSD client for a GPS dongle
+pyserial>=3.5            # Serial fallback for /dev/ttyUSB* GPS devices
+
+# Notes:
+#  * 'tkinter' is part of the standard library but Debian/Kali/Raspberry
+#    Pi OS package it separately as 'python3-tk'. It cannot come from pip
+#    — install.sh installs it with apt, and creates the venv with
+#    --system-site-packages so the venv can see it.
+#  * The ADS-B decoder itself (dump1090) is vendored as C source in
+#    third_party/dump1090 and built by install.sh — it is not a pip
+#    package and does not need to be installed separately.

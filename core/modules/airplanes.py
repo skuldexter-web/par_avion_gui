@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import curses
 import math
+import os
 import socket
 import subprocess
 import threading
@@ -68,6 +69,14 @@ class Aircraft:
         return distance, bearing
 
 
+# The copy built from the source vendored in third_party/dump1090. It is
+# tried before anything on PATH so a locally built binary always wins,
+# and so Airplanes mode works on a distribution that packages no
+# dump1090 at all (Kali, for one, has no installable candidate).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+VENDORED_DUMP1090 = os.path.join(_REPO_ROOT, "third_party", "dump1090", "dump1090")
+
+
 class Dump1090Controller:
     """Starts dump1090 as a background subprocess if not already running,
     and can be told to (re)start it explicitly from within the UI."""
@@ -79,6 +88,19 @@ class Dump1090Controller:
         self.owns_process = False
         self.last_error = ""
         self.launched_binary = ""
+
+    def candidate_binaries(self) -> List[str]:
+        """Bundled build first, then whatever is on PATH."""
+        candidates = []
+        if os.path.exists(VENDORED_DUMP1090) and os.access(VENDORED_DUMP1090, os.X_OK):
+            candidates.append(VENDORED_DUMP1090)
+        candidates.extend(self.BINARIES)
+        return candidates
+
+    @staticmethod
+    def vendored_available() -> bool:
+        return (os.path.exists(VENDORED_DUMP1090)
+                and os.access(VENDORED_DUMP1090, os.X_OK))
 
     def is_port_open(self) -> bool:
         from . import hardware
@@ -96,7 +118,7 @@ class Dump1090Controller:
     def spawn(self) -> bool:
         """Explicitly (re)launch dump1090 with --net --raw. Tries each
         known binary name in turn; records the last error if all fail."""
-        for binary in self.BINARIES:
+        for binary in self.candidate_binaries():
             try:
                 proc = subprocess.Popen(
                     [binary, "--net", "--raw", "--quiet"],
@@ -141,11 +163,18 @@ class Dump1090Controller:
             )
 
         if not self.last_error:
-            self.last_error = (
-                "No dump1090 binary found on PATH (tried: "
-                + ", ".join(self.BINARIES) + "). Run install.sh, or install "
-                "dump1090 manually."
-            )
+            if self.vendored_available():
+                self.last_error = (
+                    "The bundled dump1090 did not open port 30002 — is an "
+                    "RTL-SDR plugged in and free (not claimed by the "
+                    "dvb_usb_rtl28xxu kernel driver)?"
+                )
+            else:
+                self.last_error = (
+                    "No dump1090 binary available. The source ships in "
+                    "third_party/dump1090 — build it with './install.sh "
+                    "--dump1090-only' (or 'cd third_party/dump1090 && make')."
+                )
         return False
 
     def shutdown(self) -> None:

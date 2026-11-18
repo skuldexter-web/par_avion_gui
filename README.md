@@ -1,48 +1,62 @@
-# PAR AVION GUI
+# PAR AVION
 
-**A modern, mouse-driven graphical interface for the PAR AVION Tactical RF, ADS-B, Maritime AIS, Satellite & Signal Decoding Suite.**
+**Tactical RF & Telemetry Suite — a single GUI for ADS-B, AIS, SSTV, CW,
+spectrum monitoring and satellite tracking, built around an RTL-SDR.**
 
-PAR AVION GUI wraps the original terminal-based PAR AVION toolkit in a responsive [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) desktop application: a sidebar navigation rail, live system telemetry, an embedded color-coded log console, and a fully native, embedded widget for every single mode — a live rotating-sweep radar canvas for Airplanes and Maritime, a real-time spectrum + scrolling waterfall for Waterfalls, native audio controls for Radio, a live image canvas for SSTV, a live decoded-text stream for Morse, and pass-prediction readouts for the ISS Tracker.
+Everything runs inside one window. No terminal windows pop up, no mode
+shells out to a text UI, and nothing needs an API key, an account or a
+cloud service. Plug in a dongle and point it at the sky.
 
-**No mode ever opens an external terminal window.** Every decoder, tracker, and hardware controller runs as a background thread inside the GUI process itself, streaming its output directly onto on-screen canvases and text widgets.
-
-The application is **strictly dark mode** — a black/dark-slate tactical console aesthetic with neon green, cyan, and blue accents. There is no light mode.
-
-Every mode is **receive-only**. ADS-B, AIS, satellite TLE data, and amateur SSTV/CW transmissions on their conventional calling frequencies are all publicly broadcast or published information — the same sources behind sites like FlightRadar24, MarineTraffic, and N2YO. Nothing in this application transmits on any RF interface.
-
-![screenshot placeholder](assets/screenshot-dashboard.png)
-*(Screenshot: Dashboard view — hardware status and quick launch)*
+Targets Kali Linux (x86-64 / ARM) and Raspberry Pi OS (ARM32 / ARM64).
 
 ---
 
 ## Features
 
-- **Sidebar navigation rail** — one-click access to every mode and live CPU/RAM telemetry
-- **Embedded live log console** — color-coded success/warning/error/info output, streamed in real time from background worker threads, with Clear and Copy buttons
-- **Fully asynchronous backend** — every hardware scan, decoder, or subprocess call runs on a background thread; the GUI never freezes
-- **Every mode is a native embedded widget, not a terminal launch:**
-  - **Airplanes** — a live rotating-sweep circular radar canvas (concentric range rings, compass markers, plotted aircraft blips) plus an embedded "LIVE AIR TRAFFIC" data table (Callsign, Alt, Speed, Dist, Track), driving `dump1090` directly
-  - **Maritime** — the same radar canvas in AIS mode, with a "LIVE MARITIME TRAFFIC" table (Name, SOG, COG, Dist), driving `rtl_ais` directly
-  - **Waterfalls** — a live FFT spectrum line plot and a real-time scrolling color-gradient waterfall/spectrogram, both embedded Tkinter canvases
-  - **Radio** — frequency entry, band toggle, presets, volume slider, Play/Stop, driving `rtl_fm -> sox play` directly
-  - **SSTV** — a live-updating image preview canvas as the picture decodes line-by-line, Start/Stop/Save/Reset
-  - **Morse/CW** — a live decoded-text stream with adaptive WPM estimate
-  - **ISS Tracker** — sub-satellite position and next-pass prediction from entered coordinates
-  - **Dashboard** — hardware status cards (SDR/GPS/dump1090) and a quick-open grid for every mode
-- **Cross-platform installer** — detects Kali Linux vs. Raspberry Pi OS, installs system + Python dependencies into an isolated virtual environment (`venv/`), and can register a desktop application menu entry
+| Mode | What it does |
+| --- | --- |
+| **Dashboard** | Hardware status at a glance — SDR, GPS, ADS-B feed — and a jump-off point for every mode. |
+| **Airplanes** | ADS-B on 1090 MHz: rotating radar scope, live traffic table (callsign, altitude, speed, track, range, bearing) and an offline map. |
+| **Waterfalls** | Real-time spectrum analyser and scrolling waterfall with a proper VFO: drag knob, digit-click tuning, selectable step from 100 Hz to 1 MHz. |
+| **Radio** | Broadcast AM/FM tuner driving `rtl_fm` into the soundcard. |
+| **Maritime** | AIS vessel tracking: scope, live table and the same offline map. |
+| **ISS Tracker** | Live sub-satellite position, ground track, footprint and next passes — including whether each pass is visible to the naked eye. |
+| **SSTV** | Slow-scan TV decoder: Martin 1/2, Scottie 1/2/DX, Robot 36/72, with a live line-by-line preview. |
+| **Morse / CW** | CW decoder with adaptive speed tracking. |
+| **Settings** | Station position, GPS and network preferences, bundled-data status, hardware scan. |
+
+Every mode is **receive-only**. ADS-B, AIS, SSTV and CW are decoded from
+transmissions already being broadcast in the clear; orbital elements are
+published data. Nothing here keys a transmitter.
 
 ---
 
-## Prerequisites
+## Stand-alone by design
 
-- **OS:** Kali Linux (Debian x86_64/ARM) or Raspberry Pi OS / Raspbian (ARM32/ARM64)
-- **Python:** 3.9 or newer
-- **Hardware (optional but recommended):** an RTL-SDR dongle (v3/v4, Nooelec, etc.) for live Airplanes/Waterfalls/Radio/Maritime/SSTV/Morse data, and a USB GPS dongle for auto-centered radar views
-- **Display:** any X11 or Wayland desktop session (a physical monitor, VNC, or similar) — this is a GUI application, not a headless tool
+No part of PAR AVION requires an API key, an account, or a server to
+call. Specifically:
+
+* **The ADS-B decoder is bundled.** dump1090's source ships in
+  `third_party/dump1090` (BSD-3-Clause, unmodified) and `install.sh`
+  builds it. There is no dependency on the distribution packaging one —
+  which matters on Kali, where `dump1090-mutability` has no installable
+  candidate at all.
+* **The map is bundled vector data**, not tiles: Natural Earth
+  coastlines, borders, lakes and land (public domain) in `data/map/`,
+  about 3.8 MB for three levels of detail. No tile server, no key, and
+  it renders fast enough for a Pi.
+* **Satellite tracking is local.** SGP4 propagation plus coordinate
+  transforms computed in-process; no ephemeris download, no tracking
+  API. A current element set is bundled in `data/tle/`, `install.sh`
+  caches a fresh one, and you can paste elements by hand for a machine
+  that never touches a network.
+
+The one optional network use is refreshing orbital elements, from
+CelesTrak / ARISS / AMSAT — all keyless, and switchable off in Settings.
 
 ---
 
-## Installation
+## Install
 
 ```bash
 git clone https://github.com/skuldexter-web/par-avion-gui.git
@@ -51,90 +65,146 @@ chmod +x install.sh
 ./install.sh
 ```
 
-`install.sh` will:
+The installer detects Kali vs Raspberry Pi OS, installs system packages,
+builds the bundled dump1090, creates a Python virtual environment in
+`./venv` (no leading dot — a hidden `.venv` caused permission trouble on
+Kali, and PEP 668 blocks a plain `pip install` anyway), installs the
+Python dependencies, caches current orbital elements, and optionally
+adds a desktop menu entry.
 
-1. Detect whether you're on Kali Linux or Raspberry Pi OS
-2. Install system packages via `apt`: `python3-tk`, `python3-venv`, and the same SDR/audio toolchain as the CLI backend (`rtl-sdr`, `sox`, `gpsd`, `dump1090`, `rtl_ais`, `multimon-ng`, etc.)
-3. Create a dedicated virtual environment at `venv/` (required on modern Debian-based systems due to PEP 668) — the installer also fixes directory ownership automatically if it detects the project folder isn't owned by your user, which is the most common cause of a `Permission denied` error at this step
-4. Install all Python dependencies from `requirements.txt` into that environment
-5. Optionally create a desktop launcher so **PAR AVION GUI** appears in your application menu
-
-After installation, unplug and replug any SDR/GPS USB devices so the new udev rules take effect, and log out/in once to pick up the `plugdev` group membership.
-
----
-
-## Usage
-
-**Via the desktop launcher** (if created during install): find "PAR AVION GUI" in your application menu.
-
-**From the command line:**
+### Run
 
 ```bash
-cd par-avion-gui
 source venv/bin/activate
 python3 main.py
 ```
 
-### Navigating the app
+Or launch **PAR AVION GUI** from the application menu.
 
-- Use the **sidebar** on the left to switch between Dashboard, Airplanes, Waterfalls, Radio, Maritime, ISS Tracker, SSTV, Morse/CW, and Settings.
-- The **live log console** at the bottom of the window shows real-time status, warnings, and errors — colored by severity.
-- Every mode runs entirely inside the GUI. Click **Start Tracking** / **Start** / **Play** / **Start Listening** in a mode's own panel to begin — nothing opens in a separate window.
-- The **Dashboard**'s quick-open cards jump straight to any mode's tab.
+### Other install options
+
+```bash
+./install.sh --dump1090-only   # just (re)build the bundled ADS-B decoder
+./install.sh --no-launcher     # skip the desktop entry prompt
+```
 
 ---
 
-## Project Structure
+## First run
+
+Open **Settings** and set your **station position**.
+
+Range and bearing on the radar, the centre of the map and every ISS pass
+time are measured from it. With a GPS dongle it is taken from the fix
+automatically; without one, enter it by hand. Until it is set, the
+tracking modes say so plainly — they will not plot anything at a guessed
+position.
+
+---
+
+## Checking it works, without a radio
+
+Both self-tests run against synthesised signals and bundled data, so
+they need no hardware and no network:
+
+```bash
+source venv/bin/activate
+python3 tools/sstv_selftest.py          # all 7 SSTV modes, clean signal
+python3 tools/sstv_selftest.py --noisy  # ... and with noise + offset
+python3 tools/iss_selftest.py           # ISS tracking, fully offline
+python3 tools/update_tle.py --status    # which orbital elements are in use
+```
+
+`sstv_selftest.py` renders a test image to SSTV audio, decodes it back
+through the real decoder and reports the per-pixel error against the
+original. `iss_selftest.py` checks the propagator against physical
+reality — orbital altitude, speed, period, pass geometry — with
+networking disabled.
+
+---
+
+## Hardware
+
+* **RTL-SDR** (RTL2832U — v3, v4, Nooelec and similar). Required for
+  anything over the air.
+* **GPS receiver** (optional) via `gpsd` or a serial dongle. Without
+  one, set the station position by hand in Settings.
+* **HackRF** is detected if present, though the receive paths are
+  written against the RTL-SDR.
+
+Frequencies worth knowing: ADS-B 1090 MHz · AIS 161.975 / 162.025 MHz ·
+SSTV 14.230 MHz (HF) and 145.800 MHz (ISS) · 2 m and 70 cm amateur bands.
+
+---
+
+## Project layout
 
 ```
 par-avion-gui/
-├── main.py                 Universal entry point — launches the GUI
-├── install.sh                Automated installer (Kali / Raspberry Pi OS)
-├── requirements.txt           Python dependencies
-├── .gitignore
-├── README.md
-├── assets/
-│   ├── icon.png               Application icon
-│   └── par-avion-gui.desktop  Desktop launcher (generated by install.sh)
-├── core/                      Original CLI backend — unmodified decoding/
-│   │                          tracking logic (ADS-B, AIS, SSTV, Morse, ISS,
-│   │                          spectrum, hardware detection)
-│   ├── par_avion.py            Original curses entry point (kept for reference/
-│   │                          standalone CLI use; the GUI does not launch it)
-│   └── modules/                 All backend modules (airplanes, maritime, sstv,
-│                                morse, iss, radio, waterfall, hardware, radar_ui)
-└── gui/                       GUI application code
-    ├── app.py                  Main window: sidebar + view switching + console
-    ├── themes/
-    │   └── theme.py              Fixed dark tactical color palette
-    ├── components/
-    │   ├── sidebar.py            Navigation rail
-    │   ├── console.py            Embedded colored log/output panel
-    │   ├── telemetry.py          Live CPU/RAM widget
-    │   ├── radar_canvas.py       Reusable rotating-sweep radar (Airplanes/Maritime)
-    │   └── waterfall_canvas.py    Reusable spectrum + scrolling waterfall (Waterfalls)
-    └── views/                  One file per mode — every mode is a fully
-        ├── dashboard.py           embedded native widget; none spawn an
-        ├── airplanes_view.py       external terminal or subprocess window.
-        ├── waterfalls_view.py
-        ├── radio_view.py
-        ├── maritime_view.py
-        ├── iss_view.py
-        ├── sstv_view.py
-        ├── morse_view.py
-        ├── settings_view.py
-        └── base_view.py            Shared background-thread helper
+├── main.py                 Entry point — launches the GUI
+├── install.sh              Automated installer
+├── requirements.txt        Python dependencies
+├── assets/                 Icon and generated desktop launcher
+├── core/                   Back end, usable headless
+│   ├── par_avion.py        Curses CLI (kept working alongside the GUI)
+│   └── modules/
+│       ├── airplanes.py    ADS-B decode, dump1090 supervision
+│       ├── maritime.py     AIS decode (AIVDM)
+│       ├── sstv.py         SSTV decoder + encoder
+│       ├── morse.py        CW decoder
+│       ├── waterfall.py    Spectrum acquisition
+│       ├── radio.py        Broadcast AM/FM tuner
+│       ├── iss.py          SGP4 propagation, passes, ground track
+│       ├── mapdata.py      Offline vector map loader
+│       ├── hardware.py     SDR / GPS / feed detection
+│       ├── radar_ui.py     Curses radar primitives
+│       └── appconfig.py    Station position and preferences
+├── gui/
+│   ├── app.py              Window shell, sidebar, view switching
+│   ├── components/         Radar, map, spectrum, waterfall, VFO, console
+│   ├── views/              One per mode
+│   └── themes/             Fixed dark palette
+├── data/
+│   ├── map/                Natural Earth vector layers (public domain)
+│   └── tle/                Bundled ISS orbital elements
+├── third_party/
+│   └── dump1090/           Vendored ADS-B decoder source (BSD-3-Clause)
+└── tools/                  Self-tests and data builders
 ```
 
 ---
 
-## Known Limitations
+## Notes and limitations
 
-- **Morse decoding** can misread the very first character of a transmission when the sender's speed is far from the initial WPM estimate; this is a backend characteristic inherited unchanged from the CLI.
-- **`core/par_avion.py`** (the original curses interface) is kept in the repository for reference and standalone terminal use, but the GUI never invokes it — every mode's live display is now a native Tkinter widget driven directly from `core/modules/`.
+* **Appearance is dark only**, deliberately. There is no light mode and
+  no theme toggle.
+* **SSTV decode quality follows the signal.** Against a clean signal the
+  decoder is within ~1/255 per channel on every mode; at about 24 dB SNR
+  it is within 2–6 % depending on mode. Martin 2 and Scottie 2 are
+  noisier than the rest because their pixels are shortest, which leaves
+  the least to average over.
+* **CW decoding** is reliable at roughly 10–25 WPM. Well above that, the
+  first character of a transmission can be misread while the speed
+  estimator calibrates; it shows as `?` rather than a wrong letter.
+* **Orbital elements age.** Pass times drift by roughly a minute after a
+  couple of weeks on stale elements. The ISS tab always shows the age
+  and says what that means — refresh when you can.
+* **Map detail** is coastline, border and lake level, not streets.
+  Street-level offline coverage would mean gigabytes of tiles; this is
+  a few megabytes and tells you where things are relative to the coast
+  and to you.
+* **Raspberry Pi**: a Pi 4 or 5 handles everything comfortably. On a
+  Pi 3 the SSTV and CW decoders are the heavy paths; reduce spectrum
+  averaging in the Waterfalls tab if the display feels sluggish.
 
 ---
 
-## License
+## Credits and licences
 
-No license specified — add one appropriate for your intended distribution before publishing.
+* **dump1090** — Salvatore Sanfilippo (antirez), BSD-3-Clause. Vendored
+  unmodified in `third_party/dump1090`; see the licence there.
+* **Natural Earth** — public domain map data, naturalearthdata.com.
+* **Orbital elements** — published by US Space Force, distributed via
+  CelesTrak, ARISS and AMSAT.
+* SSTV timing follows JL Barber (N7CXI), *Proposal for SSTV Mode
+  Specifications* (Dayton, 2000).

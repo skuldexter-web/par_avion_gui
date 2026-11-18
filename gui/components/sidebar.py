@@ -51,7 +51,7 @@ class Sidebar(ctk.CTkFrame):
         )
         header.pack(pady=(18, 0))
         subheader = ctk.CTkLabel(
-            self, text="Tactical RF Suite v2.0",
+            self, text="Tactical RF Suite v2.1",
             font=ctk.CTkFont(size=11),
             text_color=theme.text_dim,
         )

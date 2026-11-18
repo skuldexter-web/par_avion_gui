@@ -178,8 +178,23 @@ class DashboardView(BaseView):
             self._set_card(self.gps_card, f"{report.gps.lat:.3f}, {report.gps.lon:.3f}", ACCENT_GREEN)
             self.console.log("GPS fix acquired.", "success")
         else:
-            self._set_card(self.gps_card, "No fix", ACCENT_AMBER)
-            self.console.log("No GPS fix — radar modes will use relative estimation.", "warning")
+            # No fix is not fatal: a manually entered home location
+            # gives correct ranges and bearings. Say which one is
+            # actually in force rather than implying the radar will
+            # invent something.
+            from modules import appconfig
+            lat, lon, source = appconfig.reference_location(report.gps)
+            if lat is not None:
+                self._set_card(self.gps_card, f"{lat:.3f}, {lon:.3f} (manual)",
+                               ACCENT_AMBER)
+                self.console.log(
+                    "No GPS fix — using the home location from Settings: "
+                    f"{lat:+.4f}, {lon:+.4f}.", "info")
+            else:
+                self._set_card(self.gps_card, "No fix", ACCENT_AMBER)
+                self.console.log(
+                    "No GPS fix and no home location set. Range and bearing "
+                    "need a position — set one in Settings.", "warning")
 
         if report.dump1090_running:
             self._set_card(self.dump1090_card, "Running", ACCENT_GREEN)

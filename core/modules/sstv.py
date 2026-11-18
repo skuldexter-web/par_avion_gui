@@ -9,30 +9,64 @@ mode in use, then decodes the audio tone stream into an image using
 real per-mode timing constants.
 
 Supported modes: Martin 1, Martin 2, Scottie 1, Scottie 2, Scottie DX,
-Robot 36, Robot 72 — covering every mode named in the spec (Martin 1/2,
-Scottie 1/2, Robot 36/72) plus Scottie DX, a closely related variant
-sharing the same decode path at no extra cost.
+Robot 36, Robot 72.
 
-Decode approach (standard technique used by slowrx, MMSSTV, QSSTV, etc.):
-  1. VIS detection: 300ms 1900Hz leader tone, 10ms 1200Hz break, a
-     second 300ms 1900Hz leader, a 30ms 1200Hz start bit, then 7 data
-     bits + 1 even-parity bit (30ms each: 1300Hz=0, 1100Hz=1), then a
-     30ms 1200Hz stop bit. The 7 data bits form the VIS code identifying
-     the mode; the parity bit is checked so a garbled header is rejected
-     rather than mis-identified as a mode.
-  2. Per-line decode: for each scan line, locate the sync pulse, then
-     read each channel's pixel run. Frequency-to-luminance conversion
-     uses a *continuous* instantaneous-frequency estimate across the
-     whole line (Hilbert transform + phase derivative, sampled at each
-     pixel's center), NOT a per-pixel-window frequency estimate — the
-     fastest modes (Robot 36) have pixel windows as short as ~6 samples
-     at 44.1kHz, far too few samples for a block-based Goertzel/FFT bin
-     to resolve 800Hz of bandwidth (bin spacing at that window length is
-     roughly 2-3x the entire black-to-white frequency range). Tracking
-     phase continuously across the whole line and sampling it at each
-     pixel's midpoint sidesteps that resolution floor, at the cost of
-     needing a few samples of padding/settling time at each end of the
-     line to avoid Hilbert-transform edge artifacts.
+TIMING SOURCE
+-------------
+Every constant below comes from JL Barber (N7CXI), "Proposal for SSTV
+Mode Specifications" (Dayton 2000) — the de-facto SSTV spec — and is
+cross-checked against the line times in windytan/slowrx's modespec.c
+and the mode tables in "Image Communication on Short Waves".
+
+Each mode is described as an explicit *segment list* (sync pulse, gaps,
+and scan segments with their own durations and sample counts) rather
+than a single parametric formula. That matters: the Robot modes are not
+"three equal colour channels" like Martin/Scottie, and a one-size
+formula silently mis-times them. Specifically:
+
+  Robot 36 (150 ms line, 4:2:0):
+    sync 9 ms | porch 3 ms | Y 88 ms | separator 4.5 ms | porch 1.5 ms
+    | chroma 44 ms
+    The separator tone encodes line parity: 1500 Hz on even lines
+    (carrying R-Y) and 2300 Hz on odd lines (carrying B-Y). Each chroma
+    scan is shared between the two lines of its pair.
+
+  Robot 72 (300 ms line, 4:2:2):
+    sync 9 ms | porch 3 ms | Y 138 ms | sep 4.5 ms | porch 1.5 ms
+    | R-Y 69 ms | sep 4.5 ms | porch 1.5 ms | B-Y 69 ms
+    Both chroma channels are present on every line, at half the Y
+    sample rate.
+
+Note the Y scan is *not* at the chroma pixel rate: Robot 36 spends
+88 ms on 320 Y samples (0.275 ms/px) but only 44 ms on its chroma
+(0.1375 ms/px). Reading Y at the chroma rate — the previous bug here —
+covers only the first half of each Y scan, so the left half of the
+picture is stretched across the whole width and the right half is never
+seen at all.
+
+DECODE APPROACH
+---------------
+  1. VIS detection scans the *whole* rolling buffer, not just its
+     start, so a header that begins mid-buffer still locks: the audio
+     is reduced to a coarse instantaneous-frequency track (one value
+     per 2 ms) and the leader/break/leader/start-bit pattern is matched
+     at every offset with vectorised numpy ops. Then 7 data bits plus
+     an even-parity bit are read (1300 Hz = 0, 1100 Hz = 1) and the
+     parity is verified, so a garbled header is rejected rather than
+     mis-identified as a mode.
+  2. Per-line decode reads each segment's pixel run from a *continuous*
+     instantaneous-frequency estimate across the whole line (analytic
+     signal + phase derivative, sampled at each pixel's centre), NOT a
+     per-pixel-window frequency estimate — the fastest modes have pixel
+     windows only a handful of samples long, far too few for a
+     block-based Goertzel/FFT bin to resolve 800 Hz of bandwidth. The
+     line slice is edge-padded so the estimate has settling room at
+     both ends (and so the final line of a transmission still decodes
+     when the audio simply stops).
+  3. Each line re-acquires the 1200 Hz sync pulse within a small search
+     window around where it is expected, and the correction is carried
+     forward. Without this, sub-millisecond timing error accumulates
+     over 240-256 lines and the picture shears.
 
 Receive-only: decodes audio already present at the input; transmits
 nothing.
@@ -46,9 +80,9 @@ import os
 import struct
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 try:
     import numpy as np
@@ -60,14 +94,12 @@ try:
     from scipy.signal import hilbert as _scipy_hilbert
     HAVE_SCIPY = True
 except ImportError:
+    _scipy_hilbert = None
     HAVE_SCIPY = False
 
 from . import radar_ui
 
-# 44.1kHz matches what real SSTV software (slowrx, MMSSTV, QSSTV) uses;
-# 22.05kHz was tried first but leaves too few samples per pixel for the
-# fastest modes (Robot 36) to resolve reliably even with continuous phase
-# tracking — see module docstring.
+# 44.1kHz matches what real SSTV software (slowrx, MMSSTV, QSSTV) uses.
 SAMPLE_RATE = 44100
 CAPTURE_DIR_DEFAULT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "captures", "sstv"
@@ -85,50 +117,197 @@ VIS_BIT0_HZ = 1300.0
 VIS_BIT1_HZ = 1100.0
 VIS_STOP_HZ = 1200.0
 VIS_STOP_SEC = 0.030
+VIS_HEADER_SEC = (
+    VIS_LEADER_SEC + VIS_BREAK_SEC + VIS_LEADER_SEC + VIS_START_SEC
+    + VIS_BIT_SEC * 8 + VIS_STOP_SEC
+)
 
 SYNC_HZ = 1200.0
 BLACK_HZ = 1500.0
 WHITE_HZ = 2300.0
 
+# Robot separator tones that encode line parity (Robot 36).
+ROBOT_SEP_EVEN_HZ = 1500.0   # this line carries R-Y
+ROBOT_SEP_ODD_HZ = 2300.0    # this line carries B-Y
+
+
+# ---------------------------------------------------------------------------
+# Mode specifications — explicit segment lists
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Segment:
+    """One timed piece of a scan line.
+
+    kind     "sync" (1200 Hz line sync), "gap" (porch/separator), or
+             "scan" (actual picture data).
+    seconds  duration.
+    channel  for scan segments: "R"/"G"/"B" (Martin, Scottie), "Y",
+             "C" (Robot 36's parity-dependent chroma), "RY", "BY".
+    samples  how many pixel samples to take across this scan segment.
+    tone_hz  expected tone for sync/gap segments; 0.0 when it varies
+             (Robot 36's separator, which encodes line parity).
+    """
+    kind: str
+    seconds: float
+    channel: str = ""
+    samples: int = 0
+    tone_hz: float = 0.0
+
 
 @dataclass
 class ModeSpec:
-    """Per-mode SSTV timing/layout, values from Dave Jones (KB4YZ) VIS
-    table and the standard slowrx/MMSSTV timing constants."""
     name: str
     vis_code: int
     line_pixels: int
     image_lines: int
-    sync_seconds: float
-    porch_seconds: float
-    pixel_seconds: float
-    septr_seconds: float
-    layout: str       # "rgb_sequential_linestart" | "rgb_sequential_scottie" | "robot_yuv"
+    layout: str                       # "rgb" | "robot36" | "robot72"
+    segments: List[Segment] = field(default_factory=list)
+
+    # ---- derived -----------------------------------------------------
+    def line_seconds(self) -> float:
+        """Time from the start of one line to the start of the next."""
+        return sum(s.seconds for s in self.segments)
+
+    def sync_offset_seconds(self) -> float:
+        """Offset of the sync pulse from the start of the line window.
+        Martin/Robot start the line on sync (0.0); Scottie's sync sits
+        mid-line, after the green and blue scans."""
+        t = 0.0
+        for s in self.segments:
+            if s.kind == "sync":
+                return t
+            t += s.seconds
+        return 0.0
+
+    def sync_seconds(self) -> float:
+        for s in self.segments:
+            if s.kind == "sync":
+                return s.seconds
+        return 0.0
+
+    def segment_offsets(self) -> List[Tuple[Segment, float]]:
+        """[(segment, offset_seconds_from_line_start), ...]"""
+        out = []
+        t = 0.0
+        for s in self.segments:
+            out.append((s, t))
+            t += s.seconds
+        return out
+
+    def scan_seconds(self, channel: str) -> float:
+        for s in self.segments:
+            if s.kind == "scan" and s.channel == channel:
+                return s.seconds
+        return 0.0
+
+
+def _martin(name: str, vis_code: int, pixel_seconds: float) -> ModeSpec:
+    """Martin M1/M2 — N7CXI: sync 4.862 ms, porch 0.572 ms, then
+    G / sep / B / sep / R / sep, all separators 0.572 ms @ 1500 Hz.
+    M1 line = 446.446 ms, M2 line = 226.798 ms."""
+    scan = pixel_seconds * 320
+    sep = 0.000572
+    return ModeSpec(
+        name=name, vis_code=vis_code, line_pixels=320, image_lines=256,
+        layout="rgb",
+        segments=[
+            Segment("sync", 0.004862, tone_hz=SYNC_HZ),
+            Segment("gap", sep, tone_hz=1500.0),
+            Segment("scan", scan, "G", 320),
+            Segment("gap", sep, tone_hz=1500.0),
+            Segment("scan", scan, "B", 320),
+            Segment("gap", sep, tone_hz=1500.0),
+            Segment("scan", scan, "R", 320),
+            Segment("gap", sep, tone_hz=1500.0),
+        ],
+    )
+
+
+def _scottie(name: str, vis_code: int, pixel_seconds: float) -> ModeSpec:
+    """Scottie S1/S2/DX — N7CXI: sep 1.5 ms / G / sep 1.5 ms / B /
+    sync 9 ms / porch 1.5 ms / R. S1 line = 428.22 ms."""
+    scan = pixel_seconds * 320
+    sep = 0.0015
+    return ModeSpec(
+        name=name, vis_code=vis_code, line_pixels=320, image_lines=256,
+        layout="rgb",
+        segments=[
+            Segment("gap", sep, tone_hz=1500.0),
+            Segment("scan", scan, "G", 320),
+            Segment("gap", sep, tone_hz=1500.0),
+            Segment("scan", scan, "B", 320),
+            Segment("sync", 0.009, tone_hz=SYNC_HZ),
+            Segment("gap", sep, tone_hz=1500.0),
+            Segment("scan", scan, "R", 320),
+        ],
+    )
+
+
+def _robot36() -> ModeSpec:
+    """Robot 36 Color — N7CXI: 150 ms line, Y 88 ms, chroma 44 ms,
+    separator 4.5 ms (1500 Hz even / 2300 Hz odd), porch 1.5 ms."""
+    return ModeSpec(
+        name="Robot 36", vis_code=0x08, line_pixels=320, image_lines=240,
+        layout="robot36",
+        segments=[
+            Segment("sync", 0.009, tone_hz=SYNC_HZ),
+            Segment("gap", 0.003, tone_hz=1500.0),
+            Segment("scan", 0.088, "Y", 320),
+            Segment("gap", 0.0045, tone_hz=0.0),   # parity separator
+            Segment("gap", 0.0015, tone_hz=1900.0),
+            Segment("scan", 0.044, "C", 160),
+        ],
+    )
+
+
+def _robot72() -> ModeSpec:
+    """Robot 72 Color — N7CXI: 300 ms line, Y 138 ms, R-Y 69 ms,
+    B-Y 69 ms, separators 4.5 ms, porches 1.5 ms."""
+    return ModeSpec(
+        name="Robot 72", vis_code=0x0C, line_pixels=320, image_lines=240,
+        layout="robot72",
+        segments=[
+            Segment("sync", 0.009, tone_hz=SYNC_HZ),
+            Segment("gap", 0.003, tone_hz=1500.0),
+            Segment("scan", 0.138, "Y", 320),
+            Segment("gap", 0.0045, tone_hz=1500.0),
+            Segment("gap", 0.0015, tone_hz=1900.0),
+            Segment("scan", 0.069, "RY", 160),
+            Segment("gap", 0.0045, tone_hz=1500.0),
+            Segment("gap", 0.0015, tone_hz=1900.0),
+            Segment("scan", 0.069, "BY", 160),
+        ],
+    )
 
 
 MODE_SPECS: List[ModeSpec] = [
-    ModeSpec("Martin 1", 0x2C, 320, 256, 0.004862, 0.000572, 0.0004576, 0.000572, "rgb_sequential_linestart"),
-    ModeSpec("Martin 2", 0x28, 320, 256, 0.004862, 0.000572, 0.0002288, 0.000572, "rgb_sequential_linestart"),
-    ModeSpec("Scottie 1", 0x3C, 320, 256, 0.009, 0.0015, 0.0004320, 0.0015, "rgb_sequential_scottie"),
-    ModeSpec("Scottie 2", 0x38, 320, 256, 0.009, 0.0015, 0.0002752, 0.0015, "rgb_sequential_scottie"),
-    ModeSpec("Scottie DX", 0x4C, 320, 256, 0.009, 0.0015, 0.00108053, 0.0015, "rgb_sequential_scottie"),
-    ModeSpec("Robot 36", 0x08, 320, 240, 0.009, 0.003, 0.0001375, 0.006, "robot_yuv"),
-    ModeSpec("Robot 72", 0x0C, 320, 240, 0.009, 0.003, 0.0002875, 0.0047, "robot_yuv"),
+    _martin("Martin 1", 0x2C, 0.0004576),
+    _martin("Martin 2", 0x28, 0.0002288),
+    _scottie("Scottie 1", 0x3C, 0.0004320),
+    _scottie("Scottie 2", 0x38, 0.0002752),
+    _scottie("Scottie DX", 0x4C, 0.0010800),
+    _robot36(),
+    _robot72(),
 ]
 
 VIS_LOOKUP = {m.vis_code: m for m in MODE_SPECS}
 
 
+# ---------------------------------------------------------------------------
+# DSP helpers
+# ---------------------------------------------------------------------------
+
 def _goertzel_mag(samples, sample_rate: int, target_hz: float) -> float:
-    """Goertzel algorithm: magnitude of the DFT bin nearest target_hz,
-    much cheaper than a full FFT when only a few frequencies matter."""
+    """Goertzel algorithm: magnitude of the DFT bin nearest target_hz.
+    Used only where windows are long (VIS bits are 30 ms = 1323 samples
+    at 44.1 kHz); never for per-pixel decoding."""
     n = len(samples)
     if n == 0:
         return 0.0
     k = int(0.5 + (n * target_hz) / sample_rate)
     w = 2 * math.pi * k / n
-    cos_w = math.cos(w)
-    coeff = 2 * cos_w
+    coeff = 2 * math.cos(w)
     s_prev, s_prev2 = 0.0, 0.0
     for sample in samples:
         s = sample + coeff * s_prev - s_prev2
@@ -138,166 +317,229 @@ def _goertzel_mag(samples, sample_rate: int, target_hz: float) -> float:
     return math.sqrt(max(0.0, power))
 
 
-def _instantaneous_freq_hz(samples, sample_rate: int, lo_hz: float = 1000.0, hi_hz: float = 2500.0,
-                             bins: int = 30) -> float:
-    """Estimate the dominant frequency within [lo_hz, hi_hz] using a bank
-    of Goertzel filters. Suitable for VIS header bit detection, where
-    each window is a fixed 30ms (over a thousand samples at 44.1kHz) —
-    plenty for a block-based bin search to resolve the 200Hz gap between
-    the two VIS tone frequencies. NOT suitable for per-pixel SSTV image
-    decoding, where windows can be as short as ~6 samples; use
-    `line_instantaneous_freq_curve` for that instead (see module
-    docstring for why)."""
-    if not HAVE_NUMPY or len(samples) == 0:
-        return lo_hz
-    best_freq = lo_hz
-    best_mag = -1.0
-    step = (hi_hz - lo_hz) / bins
-    for i in range(bins + 1):
-        f = lo_hz + i * step
-        mag = _goertzel_mag(samples, sample_rate, f)
-        if mag > best_mag:
-            best_mag = mag
-            best_freq = f
-    return best_freq
+def _analytic_inst_freq(samples, sample_rate: int):
+    """Instantaneous frequency (Hz) per sample via the analytic signal's
+    phase derivative. Falls back to a pure-numpy analytic signal if
+    scipy isn't installed, so SSTV still works without scipy."""
+    x = np.asarray(samples, dtype=np.float64)
+    n = x.size
+    if n < 4:
+        return np.full(max(n, 1), BLACK_HZ, dtype=np.float64)
+
+    if HAVE_SCIPY:
+        analytic = _scipy_hilbert(x)
+    else:
+        # Equivalent to scipy.signal.hilbert: zero the negative-frequency
+        # half of the spectrum and double the positive half.
+        spec = np.fft.fft(x)
+        h = np.zeros(n)
+        if n % 2 == 0:
+            h[0] = h[n // 2] = 1.0
+            h[1:n // 2] = 2.0
+        else:
+            h[0] = 1.0
+            h[1:(n + 1) // 2] = 2.0
+        analytic = np.fft.ifft(spec * h)
+
+    # Phase difference between consecutive samples, wrapped to (-pi, pi].
+    prod = analytic[1:] * np.conj(analytic[:-1])
+    dphase = np.angle(prod)
+    freq = dphase / (2.0 * np.pi) * sample_rate
+    return np.concatenate([freq, freq[-1:]])
 
 
 def line_instantaneous_freq_curve(samples, sample_rate: int, smooth_n: int = 3):
-    """
-    Compute a continuous instantaneous-frequency curve across an entire
-    audio segment via the Hilbert transform (analytic signal) and phase
-    derivative, then lightly smooth it. This is accurate down to just a
-    few samples per "pixel" because it never re-estimates frequency from
-    an isolated short window — it tracks phase across the whole segment
-    at once and the caller samples the resulting curve at each pixel's
-    center. Returns a numpy array the same length as `samples`; the
-    first/last few samples are less reliable (Hilbert edge artifacts),
-    so callers should pass in a segment with a little padding on both
-    sides and avoid sampling within ~5 samples of either end.
-    """
-    if not HAVE_NUMPY or not HAVE_SCIPY or len(samples) < 4:
+    """Continuous instantaneous-frequency curve across an audio segment,
+    lightly smoothed. Accurate down to a few samples per pixel because
+    it never re-estimates frequency from an isolated short window. The
+    first/last few samples are less reliable (edge artifacts), so
+    callers pass a padded segment and avoid sampling right at the ends."""
+    if not HAVE_NUMPY or len(samples) < 4:
         return np.full(len(samples), BLACK_HZ, dtype=np.float64) if HAVE_NUMPY else []
 
-    analytic = _scipy_hilbert(np.asarray(samples, dtype=np.float64))
-    phase = np.unwrap(np.angle(analytic))
-    inst_freq = np.diff(phase) / (2.0 * np.pi) * sample_rate
-    inst_freq = np.concatenate([inst_freq, [inst_freq[-1]]])
-
-    if smooth_n > 1 and len(inst_freq) >= smooth_n:
+    inst_freq = _analytic_inst_freq(samples, sample_rate)
+    if smooth_n > 1 and inst_freq.size >= smooth_n:
         kernel = np.ones(smooth_n) / smooth_n
         inst_freq = np.convolve(inst_freq, kernel, mode="same")
-
-    return inst_freq
+    # A sample-by-sample phase derivative amplifies additive noise: a
+    # few hundredths of a radian of phase error is hundreds of Hz of
+    # apparent frequency error. Clamping to a little either side of the
+    # SSTV tone range stops individual noise spikes from dragging a
+    # pixel's averaged value far off, without biasing clean signals
+    # (which never leave 1200-2300 Hz).
+    return np.clip(inst_freq, 800.0, 2800.0)
 
 
 def freq_to_luminance(freq_hz: float) -> int:
     """Map an SSTV tone frequency to a 0-255 pixel value (1500Hz=black,
-    2300Hz=white, linear in between, per the SSTV convention)."""
+    2300Hz=white, linear in between)."""
     frac = (freq_hz - BLACK_HZ) / (WHITE_HZ - BLACK_HZ)
     return max(0, min(255, int(round(frac * 255))))
 
 
+def _freq_array_to_values(freqs):
+    """Vectorised freq_to_luminance for a numpy array."""
+    vals = (np.asarray(freqs, dtype=np.float64) - BLACK_HZ) / (WHITE_HZ - BLACK_HZ) * 255.0
+    return np.clip(np.rint(vals), 0, 255)
+
+
+# ---------------------------------------------------------------------------
+# VIS header detection
+# ---------------------------------------------------------------------------
+
+VIS_TRACK_WIN_SEC = 0.002   # coarse frequency track resolution
+
+
 class VisDetector:
-    """Scans a rolling audio buffer for the SSTV VIS header and, when
-    found, returns the decoded ModeSpec."""
+    """Scans a rolling audio buffer for the SSTV VIS header anywhere in
+    the buffer (not only at its start) and returns the decoded ModeSpec
+    together with the sample index where the picture data begins."""
 
     def __init__(self, sample_rate: int = SAMPLE_RATE):
         self.sample_rate = sample_rate
+        self.last_vis_code: Optional[int] = None
+        self.last_reject_reason = ""
 
-    def try_detect(self, buf) -> Optional[ModeSpec]:
-        """buf: a numpy float32 array of recent audio samples. Looks for
-        the VIS header: 300ms 1900Hz leader, 10ms 1200Hz break, a second
-        300ms 1900Hz leader, a 30ms 1200Hz start bit, 7 data bits + 1
-        even-parity bit (30ms each, 1300Hz=0 / 1100Hz=1), then a 30ms
-        1200Hz stop bit. Returns None if no valid header is found in
-        this buffer (caller should keep accumulating and retry)."""
+    # -- coarse track -------------------------------------------------
+    def _track(self, buf):
+        win_n = max(1, int(VIS_TRACK_WIN_SEC * self.sample_rate))
+        usable = (len(buf) // win_n) * win_n
+        if usable < win_n * 8:
+            return None, win_n
+        freqs = _analytic_inst_freq(buf[:usable], self.sample_rate)
+        track = freqs.reshape(-1, win_n).mean(axis=1)
+        return track, win_n
+
+    def try_detect(self, buf) -> Optional[Tuple[ModeSpec, int]]:
+        """Returns (mode, data_start_sample) or None."""
         if not HAVE_NUMPY:
             return None
+        track, win_n = self._track(buf)
+        if track is None:
+            return None
 
-        leader_samples = int(VIS_LEADER_SEC * self.sample_rate)
-        break_samples = int(VIS_BREAK_SEC * self.sample_rate)
-        start_samples = int(VIS_START_SEC * self.sample_rate)
-        bit_samples = int(VIS_BIT_SEC * self.sample_rate)
-        stop_samples = int(VIS_STOP_SEC * self.sample_rate)
+        def wins(seconds: float) -> int:
+            return max(1, int(round(seconds / VIS_TRACK_WIN_SEC)))
 
-        needed = (
-            leader_samples + break_samples + leader_samples + start_samples
-            + bit_samples * 8  # 7 data bits + 1 parity bit
-            + stop_samples
+        n_leader = wins(VIS_LEADER_SEC)
+        n_break = wins(VIS_BREAK_SEC)
+        n_start = wins(VIS_START_SEC)
+        n_bit = wins(VIS_BIT_SEC)
+        n_header = n_leader + n_break + n_leader + n_start + n_bit * 9  # +stop
+
+        if track.size < n_header:
+            return None
+
+        tol = 150.0
+        near_leader = (np.abs(track - VIS_LEADER_HZ) < tol).astype(np.float64)
+        near_1200 = (np.abs(track - VIS_BREAK_HZ) < tol).astype(np.float64)
+
+        def frac(flags, length: int):
+            """Rolling mean of `flags` over `length` windows, aligned so
+            index i is the mean of flags[i:i+length]."""
+            c = np.concatenate([[0.0], np.cumsum(flags)])
+            return (c[length:] - c[:-length]) / length
+
+        f_leader = frac(near_leader, n_leader)
+        f_break = frac(near_1200, n_break)
+        f_start = frac(near_1200, n_start)
+
+        max_start = track.size - n_header
+        if max_start <= 0:
+            return None
+        idx = np.arange(max_start + 1)
+
+        off_l1 = idx
+        off_bk = idx + n_leader
+        off_l2 = idx + n_leader + n_break
+        off_st = idx + n_leader + n_break + n_leader
+
+        ok = (
+            (f_leader[off_l1] >= 0.80)
+            & (f_break[off_bk] >= 0.50)
+            & (f_leader[off_l2] >= 0.80)
+            & (f_start[off_st] >= 0.60)
         )
-        if len(buf) < needed:
+        candidates = np.flatnonzero(ok)
+        if candidates.size == 0:
             return None
 
-        # Confirm a strong 1900Hz tone at the start of the buffer (first
-        # leader). A real receiver would also re-scan at multiple offsets
-        # to find where the leader actually starts; the caller retries
-        # this each time new audio arrives, which serves the same purpose
-        # at coarser granularity.
-        leader_mag = _goertzel_mag(buf[:leader_samples], self.sample_rate, VIS_LEADER_HZ)
-        noise_mag = _goertzel_mag(buf[:leader_samples], self.sample_rate, 1900.0 + 400.0)
-        if leader_mag < noise_mag * 1.5 or leader_mag < 1.0:
-            return None
+        for cand in candidates:
+            header_start = int(cand) * win_n
+            result = self._read_bits(buf, header_start)
+            if result is not None:
+                return result
+        return None
 
-        pos = leader_samples
-        pos += break_samples          # 10ms 1200Hz break
-        pos += leader_samples          # second 300ms 1900Hz leader
-        pos += start_samples           # 30ms 1200Hz start bit
+    def _read_bits(self, buf, header_start: int) -> Optional[Tuple[ModeSpec, int]]:
+        """Read the 7 data bits + parity at a confirmed header position."""
+        sr = self.sample_rate
+        pos = header_start + int(
+            (VIS_LEADER_SEC + VIS_BREAK_SEC + VIS_LEADER_SEC + VIS_START_SEC) * sr
+        )
+        bit_n = int(VIS_BIT_SEC * sr)
+        if pos + bit_n * 9 > len(buf):
+            return None
 
         bits = []
-        for _ in range(8):  # 7 data bits + 1 parity bit, LSB first
-            window = buf[pos: pos + bit_samples]
-            f0_mag = _goertzel_mag(window, self.sample_rate, VIS_BIT0_HZ)
-            f1_mag = _goertzel_mag(window, self.sample_rate, VIS_BIT1_HZ)
-            bits.append(1 if f1_mag > f0_mag else 0)
-            pos += bit_samples
+        for i in range(8):  # 7 data bits (LSB first) + 1 parity bit
+            # Use the middle 60% of each bit window: the edges contain
+            # the frequency transition between adjacent bits.
+            lo = pos + i * bit_n + int(bit_n * 0.2)
+            hi = pos + i * bit_n + int(bit_n * 0.8)
+            window = buf[lo:hi]
+            f0 = _goertzel_mag(window, sr, VIS_BIT0_HZ)
+            f1 = _goertzel_mag(window, sr, VIS_BIT1_HZ)
+            bits.append(1 if f1 > f0 else 0)
 
         data_bits, parity_bit = bits[:7], bits[7]
         vis_code = sum(b << i for i, b in enumerate(data_bits))
+        self.last_vis_code = vis_code
 
-        # SSTV uses even parity: the number of 1-bits across all 8 bits
-        # (7 data + parity) must be even. A mismatch usually means noise
-        # corrupted the header rather than a genuinely different mode, so
-        # treat it as "no valid header yet" rather than trusting a
-        # possibly-garbled vis_code.
+        # SSTV uses even parity across the 7 data bits + parity bit.
         if (sum(data_bits) + parity_bit) % 2 != 0:
+            self.last_reject_reason = f"VIS parity error (code {vis_code})"
             return None
 
-        return VIS_LOOKUP.get(vis_code)
+        mode = VIS_LOOKUP.get(vis_code)
+        if mode is None:
+            self.last_reject_reason = f"unsupported VIS code {vis_code}"
+            return None
 
+        data_start = header_start + int(VIS_HEADER_SEC * sr)
+        return mode, data_start
+
+
+# ---------------------------------------------------------------------------
+# Image buffer
+# ---------------------------------------------------------------------------
 
 class SstvImageBuffer:
     """Accumulates decoded RGB rows as they arrive, for live preview and
-    final save. Row order and channel assignment are handled by the
-    per-mode decoder that writes into this buffer."""
+    final save."""
 
     def __init__(self, width: int, height: int):
         self.width = width
         self.height = height
-        if HAVE_NUMPY:
-            self.pixels = np.zeros((height, width, 3), dtype=np.uint8)
-        else:
-            self.pixels = None
+        self.pixels = np.zeros((height, width, 3), dtype=np.uint8) if HAVE_NUMPY else None
         self.rows_completed = 0
-        self.last_save_was_png = False  # set by save_png(); tells the
-        # caller whether the PNG path was actually used or silently
-        # fell back to .ppm (no Pillow installed), so the UI can report
-        # the real filename instead of one that doesn't exist on disk.
+        self.last_save_was_png = False
 
     def set_row_rgb(self, row: int, r_row, g_row, b_row) -> None:
-        if not HAVE_NUMPY or row < 0 or row >= self.height:
+        if not HAVE_NUMPY or self.pixels is None or row < 0 or row >= self.height:
             return
-        self.pixels[row, :, 0] = r_row
-        self.pixels[row, :, 1] = g_row
-        self.pixels[row, :, 2] = b_row
+        self.pixels[row, :, 0] = np.clip(np.asarray(r_row), 0, 255).astype(np.uint8)
+        self.pixels[row, :, 1] = np.clip(np.asarray(g_row), 0, 255).astype(np.uint8)
+        self.pixels[row, :, 2] = np.clip(np.asarray(b_row), 0, 255).astype(np.uint8)
         self.rows_completed = max(self.rows_completed, row + 1)
 
+    def set_row_gray(self, row: int, y_row) -> None:
+        self.set_row_rgb(row, y_row, y_row, y_row)
+
     def save_png(self, path: str) -> bool:
-        if not HAVE_NUMPY:
+        if not HAVE_NUMPY or self.pixels is None:
             return False
         try:
-            # Avoid a hard dependency on Pillow: write a minimal PPM (which
-            # every image viewer and `convert`/ffmpeg can read) if Pillow
-            # isn't available, else a proper PNG.
             try:
                 from PIL import Image
                 Image.fromarray(self.pixels, "RGB").save(path)
@@ -314,186 +556,382 @@ class SstvImageBuffer:
             return False
 
 
+# ---------------------------------------------------------------------------
+# Decoder
+# ---------------------------------------------------------------------------
+
+def _yuv_to_rgb(y, cr, cb):
+    """Full-range BT.601 YCbCr -> RGB, as used by SSTV decoders.
+    y/cr/cb are numpy arrays of 0..255 values (128 = zero chroma)."""
+    y = np.asarray(y, dtype=np.float64)
+    dr = np.asarray(cr, dtype=np.float64) - 128.0
+    db = np.asarray(cb, dtype=np.float64) - 128.0
+    r = y + 1.402 * dr
+    g = y - 0.344136 * db - 0.714136 * dr
+    b = y + 1.772 * db
+    return (np.clip(r, 0, 255), np.clip(g, 0, 255), np.clip(b, 0, 255))
+
+
 class SstvDecoder:
     """
     Runs VIS detection then per-mode line decoding against a live audio
-    stream. Feed raw float32 audio samples via `feed()`; poll `snapshot()`
-    for the current partial image and status.
+    stream. Feed raw float audio samples via `feed()`; poll `process()`
+    to advance decoding and `snapshot()` for the current partial image.
     """
 
-    def __init__(self, sample_rate: int = SAMPLE_RATE):
+    # How far either side of the expected position to hunt for each
+    # line's sync pulse, and how much of that correction to apply per
+    # line (damped, so one noisy line can't yank the whole raster).
+    SYNC_SEARCH_SEC = 0.005
+    SYNC_DAMPING = 0.5
+    SYNC_MAX_MEAN_ERR_HZ = 220.0
+
+    def __init__(self, sample_rate: int = SAMPLE_RATE, buffer_seconds: float = 90.0):
         self.sample_rate = sample_rate
         self.vis_detector = VisDetector(sample_rate)
-        self._buf: List[float] = []
         self._lock = threading.Lock()
-        self.state = "listening"  # listening | decoding | done
+        self._buf = np.zeros(0, dtype=np.float32) if HAVE_NUMPY else None
+        self._buf_chunks: List = []
+        self._max_len = int(sample_rate * buffer_seconds)
+        self._dropped = 0          # samples trimmed off the front so far
+
+        self.state = "listening"   # listening | decoding | done
         self.mode: Optional[ModeSpec] = None
         self.image: Optional[SstvImageBuffer] = None
         self.current_row = 0
         self.last_error = ""
-        self._decode_pos = 0  # sample index within buffer where decode resumes
+        self.sync_locked = False
+        self.lines_without_sync = 0
 
-    def feed(self, samples) -> None:
+        self._pos = 0.0            # absolute sample index of next line start
+        self._reset_pair_state()
+
+    # -- lifecycle -----------------------------------------------------
+    def _reset_pair_state(self) -> None:
+        """Robot 36 decodes chroma once per line pair, so the first line
+        of a pair is held until its partner arrives."""
+        self._pending_row: Optional[int] = None
+        self._pending_y = None
+        self._pending_chroma = None
+        self._pending_parity: Optional[str] = None
+
+    def reset(self) -> None:
+        """Start listening for a fresh image."""
         with self._lock:
-            self._buf.extend(samples)
-            # Cap buffer growth once we're purely decoding forward.
-            max_len = self.sample_rate * 60
-            if len(self._buf) > max_len:
-                trim = len(self._buf) - max_len
-                self._buf = self._buf[trim:]
-                self._decode_pos = max(0, self._decode_pos - trim)
+            self.state = "listening"
+            self.mode = None
+            self.image = None
+            self.current_row = 0
+            self.sync_locked = False
+            self.lines_without_sync = 0
+            self._pos = 0.0
+            self._reset_pair_state()
+            self._buf = np.zeros(0, dtype=np.float32)
+            self._buf_chunks = []
+            self._dropped = 0
 
-    def _samples_view(self):
+    # -- audio input ---------------------------------------------------
+    def feed(self, samples) -> None:
+        """Append audio. Accepts a numpy array or any float sequence.
+        Thread-safe; called from the capture thread."""
         if not HAVE_NUMPY:
-            return []
-        return np.array(self._buf, dtype=np.float32)
+            return
+        arr = np.asarray(samples, dtype=np.float32).ravel()
+        if arr.size == 0:
+            return
+        with self._lock:
+            self._buf_chunks.append(arr)
 
+    def _consolidate(self):
+        """Merge queued chunks into the working buffer and trim history.
+        Keeping incoming audio as a list of arrays and concatenating once
+        per process() call avoids rebuilding a multi-million-element
+        array on every callback."""
+        if self._buf_chunks:
+            self._buf = np.concatenate([self._buf] + self._buf_chunks)
+            self._buf_chunks = []
+        if self._buf.size > self._max_len:
+            trim = self._buf.size - self._max_len
+            # Never trim past the point we still need to decode from.
+            keep_from = int(self._pos) - self._dropped
+            if self.state == "decoding":
+                trim = min(trim, max(0, keep_from - int(0.05 * self.sample_rate)))
+            if trim > 0:
+                self._buf = self._buf[trim:]
+                self._dropped += trim
+        return self._buf
+
+    # -- main loop -----------------------------------------------------
     def process(self) -> None:
         """Call periodically (e.g. once per UI tick) to advance decoding."""
+        if not HAVE_NUMPY:
+            return
         with self._lock:
-            buf = self._samples_view()
+            buf = self._consolidate()
+            state = self.state
 
-        if not HAVE_NUMPY or len(buf) == 0:
+        if buf.size == 0:
             return
 
-        if self.state == "listening":
-            detected = self.vis_detector.try_detect(buf)
-            if detected is not None:
-                self.mode = detected
-                self.image = SstvImageBuffer(detected.line_pixels, detected.image_lines)
-                self.current_row = 0
-                header_samples = int(
-                    (VIS_LEADER_SEC + VIS_BREAK_SEC + VIS_LEADER_SEC + VIS_START_SEC
-                     + VIS_BIT_SEC * 8 + VIS_STOP_SEC) * self.sample_rate
-                )
-                self._decode_pos = header_samples
-                self.state = "decoding"
-            else:
-                # Keep only the most recent ~1s to bound the search window
-                # while still catching a header that starts mid-buffer.
+        if state == "listening":
+            found = self.vis_detector.try_detect(buf)
+            if found is not None:
+                mode, data_start = found
                 with self._lock:
-                    keep = self.sample_rate * 2
-                    if len(self._buf) > keep:
-                        self._buf = self._buf[-keep:]
+                    self.mode = mode
+                    self.image = SstvImageBuffer(mode.line_pixels, mode.image_lines)
+                    self.current_row = 0
+                    self._pos = float(data_start + self._dropped)
+                    self._reset_pair_state()
+                    self.sync_locked = False
+                    self.lines_without_sync = 0
+                    self.state = "decoding"
+            else:
+                # Bound the search window, but keep enough history that a
+                # header spanning two process() calls is still found.
+                with self._lock:
+                    keep = int(self.sample_rate * 3)
+                    if self._buf.size > keep:
+                        trim = self._buf.size - keep
+                        self._buf = self._buf[trim:]
+                        self._dropped += trim
             return
 
-        if self.state == "decoding" and self.mode is not None and self.image is not None:
+        if state == "decoding" and self.mode is not None and self.image is not None:
             self._decode_available_lines(buf)
 
+    # -- line decoding -------------------------------------------------
     def _decode_available_lines(self, buf) -> None:
         mode = self.mode
-        line_samples = int(
-            (mode.sync_seconds + mode.porch_seconds + mode.pixel_seconds * mode.line_pixels * 3
-             + mode.septr_seconds * 2) * self.sample_rate
-        )
-        # Extra samples of context on each side of the line so the
-        # Hilbert-transform frequency curve has settling room and we
-        # never sample a pixel's frequency from right at a buffer edge
-        # (see line_instantaneous_freq_curve's docstring).
-        pad = max(8, int(0.001 * self.sample_rate))  # ~1ms of padding
+        sr = self.sample_rate
+        line_n = mode.line_seconds() * sr
+        pad = int(self.SYNC_SEARCH_SEC * sr) + 16
+
         while self.current_row < mode.image_lines:
-            start = self._decode_pos
-            end = start + line_samples
-            padded_start = max(0, start - pad)
-            padded_end = end + pad
-            if padded_end > len(buf):
-                break
-            line = buf[padded_start:padded_end]
-            line_offset = start - padded_start  # where the real line begins within `line`
-            self._decode_one_line(line, line_offset, mode, self.current_row)
-            self._decode_pos = end
+            start_abs = self._pos - self._dropped
+            start = int(round(start_abs))
+            end = int(round(start_abs + line_n))
+            if start < 0:
+                # History was trimmed out from under us (very long stall).
+                self.last_error = "audio buffer underrun — decode position lost"
+                self.state = "done"
+                return
+            if end > buf.size:
+                # A line that is only a hair short is decoded anyway with
+                # the tail edge-padded: an off-air capture that stops
+                # mid-line, or one whose last line lands a few samples
+                # past the final sample, would otherwise lose that line
+                # entirely. Anything more than ~1% short waits for audio.
+                shortfall = end - buf.size
+                if shortfall > line_n * 0.01:
+                    break
+
+            lo = start - pad
+            hi = end + pad
+            clip_lo = max(0, lo)
+            clip_hi = min(buf.size, hi)
+            segment = buf[clip_lo:clip_hi]
+            # Edge-pad rather than requiring real samples on both sides,
+            # so the final line of a transmission still decodes when the
+            # audio simply stops.
+            pad_before = clip_lo - lo
+            pad_after = hi - clip_hi
+            if pad_before > 0 or pad_after > 0:
+                segment = np.pad(segment, (pad_before, pad_after), mode="edge")
+            line_offset = start - lo   # == pad
+
+            self._decode_one_line(segment, line_offset, mode, self.current_row, sr)
             self.current_row += 1
 
         if self.current_row >= mode.image_lines:
+            self._flush_pending()
             self.state = "done"
 
-    def _decode_one_line(self, line, line_offset: int, mode: ModeSpec, row: int) -> None:
-        sr = self.sample_rate
-        pixel_n = max(1, int(mode.pixel_seconds * sr))
-        sync_n = int(mode.sync_seconds * sr)
-        porch_n = int(mode.porch_seconds * sr)
-        septr_n = int(mode.septr_seconds * sr)
+    def _align_sync(self, curve, line_offset: int, mode: ModeSpec, sr: int) -> int:
+        """Find this line's 1200 Hz sync pulse near where it is expected
+        and return the correction in samples (0 if not confidently
+        found). Keeps the raster from shearing over hundreds of lines."""
+        sync_n = int(mode.sync_seconds() * sr)
+        if sync_n < 4:
+            return 0
+        expected = line_offset + int(mode.sync_offset_seconds() * sr)
+        search = int(self.SYNC_SEARCH_SEC * sr)
+
+        lo = max(0, expected - search)
+        hi = min(curve.size - sync_n, expected + search)
+        if hi <= lo:
+            return 0
+
+        # Mean |f - 1200| over a sync-length window, for every candidate
+        # offset in the search range — vectorised via cumulative sums.
+        err = np.abs(curve - SYNC_HZ)
+        c = np.concatenate([[0.0], np.cumsum(err)])
+        window_means = (c[lo + sync_n: hi + sync_n + 1] - c[lo: hi + 1]) / sync_n
+        best_rel = int(np.argmin(window_means))
+        best_err = float(window_means[best_rel])
+        if best_err > self.SYNC_MAX_MEAN_ERR_HZ:
+            self.sync_locked = False
+            self.lines_without_sync += 1
+            return 0
+
+        self.sync_locked = True
+        self.lines_without_sync = 0
+        drift = (lo + best_rel) - expected
+        return int(round(drift * self.SYNC_DAMPING))
+
+    def _decode_one_line(self, segment, line_offset: int, mode: ModeSpec,
+                         row: int, sr: int) -> None:
+        curve = line_instantaneous_freq_curve(segment, sr)
+        if curve is None or len(curve) == 0:
+            return
+
+        correction = self._align_sync(curve, line_offset, mode, sr)
+        base = line_offset + correction
+        # Carry the correction forward so the next line starts from the
+        # re-acquired position rather than re-accumulating the same error.
+        self._pos += mode.line_seconds() * sr + correction
+
+        # Cumulative sum of the frequency curve, so a pixel's mean
+        # frequency over any window is two lookups.
+        cum = np.concatenate([[0.0], np.cumsum(curve)])
+
+        def read_scan(seg: Segment, offset_sec: float):
+            """Read `seg.samples` pixel values across a scan segment.
+
+            Each pixel is the *mean* frequency over the middle of its
+            own window, not a single sample at its centre: averaging
+            cuts the phase-noise variance by the number of samples
+            averaged, which on a real off-air signal is the difference
+            between a clean picture and a speckled one. The outer ~15%
+            of each window is skipped because it holds the frequency
+            transition to the neighbouring pixel.
+            """
+            start = base + offset_sec * sr
+            step = (seg.seconds * sr) / seg.samples
+            edges = start + np.arange(seg.samples + 1) * step
+            inset = step * 0.15
+            lo = np.rint(edges[:-1] + inset).astype(np.int64)
+            hi = np.rint(edges[1:] - inset).astype(np.int64)
+            lo = np.clip(lo, 0, curve.size - 1)
+            hi = np.clip(hi, 0, curve.size)
+            # Windows too short to average (fast modes) collapse to a
+            # single sample rather than an empty slice.
+            hi = np.maximum(hi, lo + 1)
+            means = (cum[hi] - cum[lo]) / (hi - lo)
+            return _freq_array_to_values(means)
+
+        def gap_tone(seg: Segment, offset_sec: float) -> float:
+            """Mean frequency during a gap/separator segment."""
+            lo = int(round(base + offset_sec * sr))
+            hi = int(round(base + (offset_sec + seg.seconds) * sr))
+            lo = max(0, min(curve.size - 1, lo))
+            hi = max(lo + 1, min(curve.size, hi))
+            return float(np.mean(curve[lo:hi]))
+
+        channels = {}
+        sep_tone = None
+        for seg, offset in mode.segment_offsets():
+            if seg.kind == "scan":
+                channels[seg.channel] = read_scan(seg, offset)
+            elif seg.kind == "gap" and seg.tone_hz == 0.0:
+                sep_tone = gap_tone(seg, offset)
+
         w = mode.line_pixels
 
-        # One continuous frequency curve for the ENTIRE (padded) line,
-        # computed once — not re-estimated per pixel window. This is
-        # what makes fast modes like Robot 36 (as few as ~6 samples per
-        # pixel) resolvable at all; see module docstring.
-        freq_curve = line_instantaneous_freq_curve(line, sr)
+        if mode.layout == "rgb":
+            self.image.set_row_rgb(row, channels.get("R"), channels.get("G"),
+                                   channels.get("B"))
+            return
 
-        def sample_freq_at(sample_index: int) -> float:
-            idx = line_offset + sample_index
-            idx = max(0, min(len(freq_curve) - 1, idx))
-            return float(freq_curve[idx])
-
-        def read_channel(offset: int):
-            values = []
-            for px in range(w):
-                center = offset + px * pixel_n + pixel_n // 2
-                f = sample_freq_at(center)
-                values.append(freq_to_luminance(f))
-            return values, offset + w * pixel_n
-
-        if mode.layout == "rgb_sequential_linestart":
-            # Martin: sync -> porch -> G -> septr -> B -> septr -> R
-            pos = sync_n + porch_n
-            g, pos = read_channel(pos)
-            pos += septr_n
-            b, pos = read_channel(pos)
-            pos += septr_n
-            r, pos = read_channel(pos)
+        if mode.layout == "robot72":
+            y = channels["Y"]
+            cr = self._upsample(channels["RY"], w)
+            cb = self._upsample(channels["BY"], w)
+            r, g, b = _yuv_to_rgb(y, cr, cb)
             self.image.set_row_rgb(row, r, g, b)
+            return
 
-        elif mode.layout == "rgb_sequential_scottie":
-            # Scottie: sync sits mid-line (between B and R); channel order
-            # per line is G -> septr -> B -> SYNC -> porch -> septr -> R.
-            pos = 0
-            g, pos = read_channel(pos)
-            pos += septr_n
-            b, pos = read_channel(pos)
-            pos += sync_n + porch_n
-            r, pos = read_channel(pos)
+        if mode.layout == "robot36":
+            self._decode_robot36_line(row, channels, sep_tone, w)
+
+    @staticmethod
+    def _upsample(values, width: int):
+        """Nearest-neighbour upsample a half-width chroma scan to full
+        image width."""
+        values = np.asarray(values)
+        if values.size == width:
+            return values
+        idx = np.clip((np.arange(width) * values.size) // width, 0, values.size - 1)
+        return values[idx]
+
+    def _decode_robot36_line(self, row: int, channels, sep_tone, w: int) -> None:
+        """Robot 36 carries R-Y on even lines and B-Y on odd lines, each
+        shared between the two lines of its pair. The separator tone
+        (1500 Hz even / 2300 Hz odd) identifies which — more robust than
+        assuming parity from the row counter, since decoding can start
+        part-way into a transmission."""
+        y = channels["Y"]
+        chroma = self._upsample(channels["C"], w)
+
+        if sep_tone is None:
+            parity = "even" if row % 2 == 0 else "odd"
+        else:
+            d_even = abs(sep_tone - ROBOT_SEP_EVEN_HZ)
+            d_odd = abs(sep_tone - ROBOT_SEP_ODD_HZ)
+            parity = "even" if d_even <= d_odd else "odd"
+
+        if parity == "even":
+            self._flush_pending()
+            # Show luminance straight away; colour lands when the odd
+            # line of this pair arrives with the other chroma channel.
+            self.image.set_row_gray(row, y)
+            self._pending_row = row
+            self._pending_y = y
+            self._pending_chroma = chroma
+            self._pending_parity = "even"
+            return
+
+        # Odd line: pair it with the held even line if we have one.
+        if self._pending_parity == "even" and self._pending_row == row - 1:
+            cr = self._pending_chroma
+            cb = chroma
+            r, g, b = _yuv_to_rgb(self._pending_y, cr, cb)
+            self.image.set_row_rgb(self._pending_row, r, g, b)
+            r, g, b = _yuv_to_rgb(y, cr, cb)
             self.image.set_row_rgb(row, r, g, b)
+            self._reset_pair_state()
+        else:
+            # Unpaired odd line (decode started mid-pair): luminance only.
+            self.image.set_row_gray(row, y)
+            self._reset_pair_state()
 
-        elif mode.layout == "robot_yuv":
-            # Robot 36/72: sync -> porch -> Y (full width) -> septr ->
-            # alternating Cr/Cb (half width, chroma shared with adjacent
-            # row in the real spec; here each row gets its own reduced-
-            # width chroma pass reconstructed to full width for display).
-            pos = sync_n + porch_n
-            y_vals, pos = read_channel(pos)
-            pos += septr_n
-            chroma_width = w // 2
-            chroma_pixel_n = max(1, int(mode.pixel_seconds * sr))
-            chroma_vals = []
-            for px in range(chroma_width):
-                center = pos + px * chroma_pixel_n + chroma_pixel_n // 2
-                f = sample_freq_at(center)
-                chroma_vals.append(freq_to_luminance(f) - 128)
-            # Upsample chroma to full width (nearest-neighbor).
-            chroma_full = [chroma_vals[min(len(chroma_vals) - 1, px * chroma_width // w)]
-                           for px in range(w)] if chroma_vals else [0] * w
+    def _flush_pending(self) -> None:
+        """Emit a held Robot 36 even line as luminance if its partner
+        never arrived, so no row is silently left blank."""
+        if self._pending_parity == "even" and self._pending_y is not None:
+            self.image.set_row_gray(self._pending_row, self._pending_y)
+        self._reset_pair_state()
 
-            # Convert YUV-ish values to RGB for display (BT.601-style,
-            # approximate — sufficient for a live terminal preview).
-            r_row, g_row, b_row = [], [], []
-            for px in range(w):
-                yv = y_vals[px]
-                uv = chroma_full[px]
-                r_row.append(max(0, min(255, int(yv + 1.402 * uv))))
-                g_row.append(max(0, min(255, int(yv - 0.344 * uv))))
-                b_row.append(max(0, min(255, int(yv + 1.772 * uv))))
-            self.image.set_row_rgb(row, r_row, g_row, b_row)
-
+    # -- status --------------------------------------------------------
     def snapshot(self):
         return self.state, self.mode, self.image, self.current_row
 
+    def status_text(self) -> str:
+        if self.mode is None:
+            return "listening for VIS header"
+        pct = int(100 * self.current_row / self.mode.image_lines) if self.mode.image_lines else 0
+        lock = "SYNC LOCK" if self.sync_locked else "no sync lock"
+        return f"{self.mode.name}  {self.current_row}/{self.mode.image_lines} ({pct}%)  [{lock}]"
+
+
+# ---------------------------------------------------------------------------
+# Audio capture
+# ---------------------------------------------------------------------------
 
 class AudioCaptureController:
     """
     Captures audio for SSTV decoding via one of two paths:
-      - rtl_fm piped from an SDR tuned to an SSTV frequency (e.g. HAM 2m,
-        or 145.800MHz during ISS SSTV events), demodulated as narrow FM.
+      - rtl_fm piped from an SDR tuned to an SSTV frequency.
       - the system's default input device via `sounddevice`, for feeding
         audio from an external radio's speaker/headphone output.
     """
@@ -502,15 +940,20 @@ class AudioCaptureController:
         self.sample_rate = sample_rate
         self.rtl_fm_proc: Optional[subprocess.Popen] = None
         self._stream = None
+        self._stop_flag = threading.Event()
         self.mode = "none"  # "rtl_fm" | "mic" | "none"
         self.last_error = ""
 
     def start_rtl_fm(self, freq_hz: int, decoder: SstvDecoder) -> bool:
         self.stop()
+        self._stop_flag.clear()
+        cmd = [
+            "rtl_fm", "-f", str(freq_hz), "-M", "fm",
+            "-s", str(self.sample_rate), "-l", "0", "-E", "deemp", "-",
+        ]
         try:
             self.rtl_fm_proc = subprocess.Popen(
-                ["rtl_fm", "-f", str(freq_hz), "-M", "fm", "-s", str(self.sample_rate)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
         except FileNotFoundError:
             self.last_error = "rtl_fm not found on PATH (package: rtl-sdr)"
@@ -522,34 +965,39 @@ class AudioCaptureController:
         self.mode = "rtl_fm"
 
         def _pump():
-            assert self.rtl_fm_proc is not None
+            proc = self.rtl_fm_proc
             bytes_per_sample = 2  # rtl_fm outputs signed 16-bit PCM
-            chunk_samples = 2048
-            while self.rtl_fm_proc and self.rtl_fm_proc.poll() is None:
-                raw = self.rtl_fm_proc.stdout.read(chunk_samples * bytes_per_sample)
+            chunk_samples = 4096
+            while proc is not None and proc.poll() is None and not self._stop_flag.is_set():
+                raw = proc.stdout.read(chunk_samples * bytes_per_sample)
                 if not raw:
                     break
                 count = len(raw) // bytes_per_sample
                 if count == 0:
                     continue
-                ints = struct.unpack(f"<{count}h", raw[: count * bytes_per_sample])
-                floats = [v / 32768.0 for v in ints]
-                decoder.feed(floats)
+                if HAVE_NUMPY:
+                    arr = np.frombuffer(raw[: count * bytes_per_sample],
+                                        dtype="<i2").astype(np.float32) / 32768.0
+                    decoder.feed(arr)
+                else:
+                    ints = struct.unpack(f"<{count}h", raw[: count * bytes_per_sample])
+                    decoder.feed([v / 32768.0 for v in ints])
 
         threading.Thread(target=_pump, daemon=True).start()
         return True
 
     def start_mic(self, decoder: SstvDecoder) -> bool:
         self.stop()
+        self._stop_flag.clear()
         try:
             import sounddevice as sd
         except ImportError:
-            self.last_error = "sounddevice not installed (pip: python3-sounddevice)"
+            self.last_error = "sounddevice not installed (apt: python3-sounddevice)"
             return False
 
         try:
             def _callback(indata, frames, time_info, status):
-                decoder.feed(indata[:, 0].tolist())
+                decoder.feed(indata[:, 0])
 
             self._stream = sd.InputStream(
                 samplerate=self.sample_rate, channels=1, callback=_callback
@@ -561,13 +1009,56 @@ class AudioCaptureController:
             self.last_error = f"microphone input: {e}"
             return False
 
+    def start_wav(self, path: str, decoder: SstvDecoder) -> bool:
+        """Decode a recorded .wav file — useful for testing without
+        hardware, and for recovering an image from an off-air recording."""
+        self.stop()
+        self._stop_flag.clear()
+        try:
+            import wave
+            with wave.open(path, "rb") as wf:
+                channels = wf.getnchannels()
+                width = wf.getsampwidth()
+                rate = wf.getframerate()
+                frames = wf.readframes(wf.getnframes())
+        except Exception as e:
+            self.last_error = f"cannot read {os.path.basename(path)}: {e}"
+            return False
+
+        if not HAVE_NUMPY:
+            self.last_error = "numpy required to decode a wav file"
+            return False
+        dtype = {1: np.uint8, 2: "<i2", 4: "<i4"}.get(width)
+        if dtype is None:
+            self.last_error = f"unsupported wav sample width ({width * 8}-bit)"
+            return False
+        data = np.frombuffer(frames, dtype=dtype).astype(np.float32)
+        if width == 1:
+            data = (data - 128.0) / 128.0
+        else:
+            data /= float(1 << (8 * width - 1))
+        if channels > 1:
+            data = data.reshape(-1, channels)[:, 0]
+        if rate != self.sample_rate and data.size:
+            # Linear resample to the decoder's rate.
+            n_out = int(data.size * self.sample_rate / rate)
+            data = np.interp(np.linspace(0, data.size - 1, n_out),
+                             np.arange(data.size), data).astype(np.float32)
+        self.mode = "wav"
+        decoder.feed(data)
+        return True
+
     def stop(self) -> None:
+        self._stop_flag.set()
         if self.rtl_fm_proc is not None:
-            self.rtl_fm_proc.terminate()
             try:
-                self.rtl_fm_proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.rtl_fm_proc.kill()
+                self.rtl_fm_proc.terminate()
+                try:
+                    self.rtl_fm_proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.rtl_fm_proc.kill()
+            except Exception:
+                pass
             self.rtl_fm_proc = None
         if self._stream is not None:
             try:
@@ -579,15 +1070,143 @@ class AudioCaptureController:
         self.mode = "none"
 
 
+# ---------------------------------------------------------------------------
+# Synthetic encoder (self-test / offline verification)
+# ---------------------------------------------------------------------------
+
+def encode_image(rgb, mode: ModeSpec, sample_rate: int = SAMPLE_RATE,
+                 noise: float = 0.0, with_header: bool = True,
+                 leading_silence_sec: float = 0.0, seed: int = 0):
+    """
+    Render an RGB image (numpy HxWx3 uint8) to SSTV audio for `mode`,
+    walking the same segment table the decoder reads. Used by
+    tools/sstv_selftest.py to verify decoding end-to-end without
+    hardware, and handy for generating test audio.
+
+    Phase is kept continuous across segments, as a real modulator does.
+    """
+    if not HAVE_NUMPY:
+        raise RuntimeError("numpy required")
+
+    rng = np.random.default_rng(seed)
+    sr = sample_rate
+    freqs: List[np.ndarray] = []
+    # Segment lengths are derived from a running float time base rather
+    # than rounding each duration independently — rounding per segment
+    # loses a sample or so per line, which over a few hundred lines
+    # shortens the transmission enough to truncate the last line.
+    clock = {"t": 0.0, "n": 0}
+
+    def _advance(seconds: float) -> int:
+        clock["t"] += seconds
+        target = int(round(clock["t"] * sr))
+        n = target - clock["n"]
+        clock["n"] = target
+        return max(0, n)
+
+    def tone(hz: float, seconds: float) -> None:
+        n = _advance(seconds)
+        if n > 0:
+            freqs.append(np.full(n, float(hz)))
+
+    def scan(values, seconds: float) -> None:
+        """values: 0..255 array, rendered across `seconds`."""
+        n = _advance(seconds)
+        if n <= 0:
+            return
+        v = np.asarray(values, dtype=np.float64)
+        idx = np.clip((np.arange(n) * v.size) // n, 0, v.size - 1)
+        freqs.append(BLACK_HZ + (v[idx] / 255.0) * (WHITE_HZ - BLACK_HZ))
+
+    if leading_silence_sec > 0:
+        tone(700.0, leading_silence_sec)
+
+    if with_header:
+        tone(VIS_LEADER_HZ, VIS_LEADER_SEC)
+        tone(VIS_BREAK_HZ, VIS_BREAK_SEC)
+        tone(VIS_LEADER_HZ, VIS_LEADER_SEC)
+        tone(VIS_START_HZ, VIS_START_SEC)
+        code = mode.vis_code
+        ones = 0
+        for i in range(7):
+            bit = (code >> i) & 1
+            ones += bit
+            tone(VIS_BIT1_HZ if bit else VIS_BIT0_HZ, VIS_BIT_SEC)
+        tone(VIS_BIT1_HZ if ones % 2 else VIS_BIT0_HZ, VIS_BIT_SEC)  # even parity
+        tone(VIS_STOP_HZ, VIS_STOP_SEC)
+
+    h = min(mode.image_lines, rgb.shape[0])
+    w = mode.line_pixels
+
+    def row_rgb(r):
+        px = rgb[min(r, rgb.shape[0] - 1)]
+        if px.shape[0] != w:
+            idx = np.clip((np.arange(w) * px.shape[0]) // w, 0, px.shape[0] - 1)
+            px = px[idx]
+        return px[:, 0].astype(np.float64), px[:, 1].astype(np.float64), px[:, 2].astype(np.float64)
+
+    def row_ycc(r):
+        rr, gg, bb = row_rgb(r)
+        y = 0.299 * rr + 0.587 * gg + 0.114 * bb
+        cb = 128.0 - 0.168736 * rr - 0.331264 * gg + 0.5 * bb
+        cr = 128.0 + 0.5 * rr - 0.418688 * gg - 0.081312 * bb
+        return y, cr, cb
+
+    def halve(v):
+        return v.reshape(-1, 2).mean(axis=1) if v.size % 2 == 0 else v[::2]
+
+    for row in range(h):
+        if mode.layout == "rgb":
+            rr, gg, bb = row_rgb(row)
+            chan = {"R": rr, "G": gg, "B": bb}
+            for seg in mode.segments:
+                if seg.kind == "scan":
+                    scan(chan[seg.channel], seg.seconds)
+                else:
+                    tone(seg.tone_hz or SYNC_HZ, seg.seconds)
+        elif mode.layout == "robot72":
+            y, cr, cb = row_ycc(row)
+            chan = {"Y": y, "RY": halve(cr), "BY": halve(cb)}
+            for seg in mode.segments:
+                if seg.kind == "scan":
+                    scan(chan[seg.channel], seg.seconds)
+                else:
+                    tone(seg.tone_hz or SYNC_HZ, seg.seconds)
+        else:  # robot36
+            y, cr, cb = row_ycc(row)
+            even = (row % 2 == 0)
+            # Chroma is averaged over the line pair in the real spec.
+            partner = min(row + 1, h - 1) if even else max(row - 1, 0)
+            _, cr2, cb2 = row_ycc(partner)
+            chroma = halve((cr + cr2) / 2.0) if even else halve((cb + cb2) / 2.0)
+            for seg in mode.segments:
+                if seg.kind == "scan":
+                    scan(y if seg.channel == "Y" else chroma, seg.seconds)
+                elif seg.tone_hz == 0.0:
+                    tone(ROBOT_SEP_EVEN_HZ if even else ROBOT_SEP_ODD_HZ, seg.seconds)
+                else:
+                    tone(seg.tone_hz, seg.seconds)
+
+    freq_track = np.concatenate(freqs) if freqs else np.zeros(0)
+    phase = np.cumsum(2.0 * np.pi * freq_track / sr)
+    audio = np.sin(phase).astype(np.float32)
+    if noise > 0:
+        audio = audio + rng.normal(0.0, noise, audio.size).astype(np.float32)
+    return audio
+
+
+# ---------------------------------------------------------------------------
+# Curses UI (standalone CLI mode)
+# ---------------------------------------------------------------------------
+
 _PREVIEW_SHADES = " .:-=+*#%@"
 
 
 def _render_ascii_preview(win, image: SstvImageBuffer, rows_done: int) -> None:
-    """Render a coarse ASCII/grayscale preview of the image-so-far,
-    downsampled to fit the terminal window."""
+    """Coarse ASCII/grayscale preview of the image-so-far."""
     win_h, win_w = win.getmaxyx()
-    win_h = max(1, win_h - 1)
-    win_w = max(1, win_w - 1)
+    win_h = max(1, win_h - 2)
+    win_w = max(1, win_w - 2)
     if not HAVE_NUMPY or image.pixels is None or rows_done == 0:
         return
 
@@ -599,9 +1218,10 @@ def _render_ascii_preview(win, image: SstvImageBuffer, rows_done: int) -> None:
             src_col = int(out_col * image.width / win_w)
             r, g, b = image.pixels[src_row, src_col]
             lum = int(0.299 * r + 0.587 * g + 0.114 * b)
-            shade = _PREVIEW_SHADES[min(len(_PREVIEW_SHADES) - 1, lum * len(_PREVIEW_SHADES) // 256)]
+            shade = _PREVIEW_SHADES[min(len(_PREVIEW_SHADES) - 1,
+                                        lum * len(_PREVIEW_SHADES) // 256)]
             try:
-                win.addch(out_row, out_col, shade)
+                win.addch(out_row + 1, out_col + 1, shade)
             except curses.error:
                 pass
 
@@ -651,7 +1271,7 @@ def run(stdscr) -> None:
     stdscr.nodelay(True)
     stdscr.timeout(150)
 
-    saved_message = ""  # transient feedback shown after pressing S
+    saved_message = ""
 
     try:
         while True:
@@ -666,21 +1286,20 @@ def run(stdscr) -> None:
                 if input_source == "rtl_fm":
                     _start_capture()
             elif key in (ord("r"), ord("R")):
-                decoder.state = "listening"
-                decoder.mode = None
-                decoder.image = None
-                decoder.current_row = 0
+                decoder.reset()
                 saved_message = ""
             elif key in (ord("s"), ord("S")):
                 if capture_dir_error:
                     saved_message = capture_dir_error
                 elif decoder.image is not None:
                     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-                    mode_slug = (decoder.mode.name.lower().replace(" ", "") if decoder.mode else "sstv")
+                    mode_slug = (decoder.mode.name.lower().replace(" ", "")
+                                 if decoder.mode else "sstv")
                     path = os.path.join(CAPTURE_DIR_DEFAULT, f"{mode_slug}-{ts}.png")
                     if decoder.image.save_png(path):
-                        actual_path = path if decoder.image.last_save_was_png else path.rsplit(".", 1)[0] + ".ppm"
-                        saved_message = f"Saved: {os.path.basename(actual_path)}"
+                        actual = path if decoder.image.last_save_was_png \
+                            else path.rsplit(".", 1)[0] + ".ppm"
+                        saved_message = f"Saved: {os.path.basename(actual)}"
                     else:
                         saved_message = "Save FAILED — check captures/sstv/ permissions"
                 else:
@@ -694,33 +1313,35 @@ def run(stdscr) -> None:
             if image is not None:
                 _render_ascii_preview(preview_win, image, current_row)
             else:
-                msg = "Listening for VIS header (1900Hz leader tone)..."
                 try:
-                    preview_win.addstr(2, 2, msg)
+                    preview_win.addstr(2, 2, "Listening for VIS header (1900Hz leader tone)...")
                 except curses.error:
                     pass
             preview_win.noutrefresh()
 
             status_win.erase()
             status_win.border()
-            src_label = f"rtl_fm @ {sstv_freqs[freq_idx][0]}" if input_source == "rtl_fm" else "microphone"
+            src_label = (f"rtl_fm @ {sstv_freqs[freq_idx][0]}"
+                         if input_source == "rtl_fm" else "microphone")
             try:
-                status_win.addstr(1, 2, f" Input: {src_label} ", curses.color_pair(radar_ui.PAIR_CYAN))
+                status_win.addstr(1, 2, f" Input: {src_label} ",
+                                  curses.color_pair(radar_ui.PAIR_CYAN))
                 if mode is not None:
-                    pct = int(100 * current_row / mode.image_lines) if mode.image_lines else 0
-                    status_win.addstr(2, 2, f" Mode: {mode.name}   Progress: {current_row}/{mode.image_lines} lines ({pct}%) ",
-                                       curses.color_pair(radar_ui.PAIR_GREEN))
+                    status_win.addstr(2, 2, " " + decoder.status_text() + " ",
+                                      curses.color_pair(radar_ui.PAIR_GREEN))
                     if state == "done":
-                        status_win.addstr(2, 2 + 60, " DECODE COMPLETE — press S to save ",
-                                           curses.color_pair(radar_ui.PAIR_YELLOW) | curses.A_BOLD)
+                        status_win.addstr(3, 2, " DECODE COMPLETE — press S to save ",
+                                          curses.color_pair(radar_ui.PAIR_YELLOW) | curses.A_BOLD)
                 elif capture.last_error:
-                    status_win.addstr(2, 2, f" {capture.last_error[:width-4]} ", curses.color_pair(radar_ui.PAIR_RED))
+                    status_win.addstr(2, 2, f" {capture.last_error[:width-4]} ",
+                                      curses.color_pair(radar_ui.PAIR_RED))
                 if saved_message:
-                    msg_color = radar_ui.PAIR_RED if "FAILED" in saved_message else radar_ui.PAIR_GREEN
-                    status_win.addstr(3, 2, f" {saved_message[:width-4]} ", curses.color_pair(msg_color))
-                status_win.addstr(4, 2,
-                                   " [M] Input  [F] Freq  [R] Reset  [S] Save  [Q] Quit ",
-                                   curses.color_pair(radar_ui.PAIR_CYAN))
+                    color = radar_ui.PAIR_RED if "FAILED" in saved_message else radar_ui.PAIR_GREEN
+                    status_win.addstr(4, 2, f" {saved_message[:width-4]} ",
+                                      curses.color_pair(color))
+                status_win.addstr(5, 2,
+                                  " [M] Input  [F] Freq  [R] Reset  [S] Save  [Q] Quit ",
+                                  curses.color_pair(radar_ui.PAIR_CYAN))
             except curses.error:
                 pass
             status_win.noutrefresh()
